@@ -1,6 +1,7 @@
 package scmigrate
 
 import (
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -42,9 +43,12 @@ type StoredPVC struct {
 }
 
 type QuiesceRecord struct {
-	Kind             string `json:"kind"`
-	Name             string `json:"name"`
-	Namespace        string `json:"namespace"`
-	OriginalReplicas int32  `json:"originalReplicas"`
-	PodName          string `json:"podName"`
+	Kind              string                         `json:"kind"`
+	Name              string                         `json:"name"`
+	Namespace         string                         `json:"namespace"`
+	OriginalReplicas  int32                          `json:"originalReplicas"`
+	PodName           string                         `json:"podName"`
+	NodeName          string                         `json:"nodeName,omitempty"`
+	DaemonSetStrategy appsv1.DaemonSetUpdateStrategy `json:"daemonSetStrategy,omitempty"`
+	DaemonSetAffinity *corev1.Affinity               `json:"daemonSetAffinity,omitempty"`
 }

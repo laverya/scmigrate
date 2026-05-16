@@ -21,7 +21,7 @@ import (
 
 type Runner struct {
 	opts      Options
-	client    *kubernetes.Clientset
+	client    kubernetes.Interface
 	out       io.Writer
 	namespace string
 }
@@ -296,9 +296,6 @@ func (r *Runner) prepare(ctx context.Context, migration *Migration) error {
 	if err == nil {
 		fmt.Fprintf(r.out, "created destination pvc/%s\n", created.Name)
 	}
-	if err := r.waitPVCBound(ctx, source.Namespace, tempName); err != nil {
-		return err
-	}
 	migration.State = StatePrepared
 	return nil
 }
@@ -331,6 +328,13 @@ func (r *Runner) runSync(ctx context.Context, source *corev1.PersistentVolumeCla
 	}
 
 	args := []string{"sh", "-c", fmt.Sprintf("rsync %s /source/ /destination/", r.opts.RsyncArgs)}
+	nodeName := ""
+	if phase == "initial" {
+		nodeName, err = r.syncNodeName(ctx, source)
+		if err != nil {
+			return err
+		}
+	}
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      podName,
@@ -368,6 +372,9 @@ func (r *Runner) runSync(ctx context.Context, source *corev1.PersistentVolumeCla
 				{Name: "destination", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: dest.Name}}},
 			},
 		},
+	}
+	if nodeName != "" {
+		pod.Spec.Affinity = affinityForNode(nodeName)
 	}
 	if _, err := r.client.CoreV1().Pods(source.Namespace).Create(ctx, pod, metav1.CreateOptions{}); err != nil {
 		return err
@@ -650,6 +657,33 @@ func (r *Runner) consumingPods(ctx context.Context, pvc *corev1.PersistentVolume
 		}
 	}
 	return consumers, nil
+}
+
+func (r *Runner) syncNodeName(ctx context.Context, pvc *corev1.PersistentVolumeClaim) (string, error) {
+	consumers, err := r.consumingPods(ctx, pvc)
+	if err != nil {
+		return "", err
+	}
+	if len(consumers) != 1 {
+		return "", nil
+	}
+	return consumers[0].Spec.NodeName, nil
+}
+
+func affinityForNode(nodeName string) *corev1.Affinity {
+	return &corev1.Affinity{
+		NodeAffinity: &corev1.NodeAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+				NodeSelectorTerms: []corev1.NodeSelectorTerm{{
+					MatchFields: []corev1.NodeSelectorRequirement{{
+						Key:      "metadata.name",
+						Operator: corev1.NodeSelectorOpIn,
+						Values:   []string{nodeName},
+					}},
+				}},
+			},
+		},
+	}
 }
 
 func storageClass(pvc *corev1.PersistentVolumeClaim) string {

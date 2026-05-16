@@ -78,7 +78,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, `kubectl scmigrate migrates selected PVCs from one storageClass to another.
+	fmt.Fprint(os.Stderr, `kubectl scmigrate migrates selected PVCs from one storageClass to another.
 
 Usage:
   kubectl scmigrate plan --target-storage-class fast [flags]
