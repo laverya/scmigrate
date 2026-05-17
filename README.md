@@ -149,3 +149,22 @@ continue an interrupted migration.
 - The plugin leaves PV reclaim policies as `Retain` by default. Pass
   `--restore-reclaim-policy` to restore the destination PV's original policy
   after cutover.
+
+## Development
+
+Run unit tests:
+
+```sh
+make test
+```
+
+Run the kind-backed end-to-end tests:
+
+```sh
+make e2e
+```
+
+The e2e target creates a temporary kind cluster, builds and loads the rsync
+helper image, then verifies real PVC migrations for a `Deployment`,
+`StatefulSet`, and `DaemonSet`. It requires `docker`, `kind`, and `kubectl`.
+Set `KEEP_E2E_CLUSTER=1` to leave the cluster running after the test.
