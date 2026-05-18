@@ -231,7 +231,7 @@ metadata:
   namespace: %[1]s
   labels:
     scmigrate-e2e: deployment
-    scmigrate-e2e-run: %[2]s
+    scmigrate-e2e-run: "%[2]s"
 spec:
   accessModes: [ReadWriteOnce]
   storageClassName: %[4]s
@@ -312,7 +312,7 @@ spec:
       name: data
       labels:
         scmigrate-e2e: statefulset
-        scmigrate-e2e-run: %[2]s
+        scmigrate-e2e-run: "%[2]s"
     spec:
       accessModes: [ReadWriteOnce]
       storageClassName: %[4]s
@@ -331,7 +331,7 @@ metadata:
   namespace: %[1]s
   labels:
     scmigrate-e2e: daemonset
-    scmigrate-e2e-run: %[2]s
+    scmigrate-e2e-run: "%[2]s"
 spec:
   accessModes: [ReadWriteOnce]
   storageClassName: %[4]s

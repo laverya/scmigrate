@@ -313,7 +313,7 @@ func (r *Runner) runSync(ctx context.Context, source *corev1.PersistentVolumeCla
 	if old, err := r.client.CoreV1().Pods(source.Namespace).Get(ctx, podName, metav1.GetOptions{}); err == nil {
 		if old.Status.Phase == corev1.PodSucceeded {
 			fmt.Fprintf(r.out, "%s sync already completed by pod/%s\n", phase, podName)
-			return nil
+			return r.cleanupSyncPod(ctx, source.Namespace, podName)
 		}
 		if old.Status.Phase == corev1.PodFailed {
 			_ = r.client.CoreV1().Pods(source.Namespace).Delete(ctx, podName, metav1.DeleteOptions{})
@@ -321,7 +321,10 @@ func (r *Runner) runSync(ctx context.Context, source *corev1.PersistentVolumeCla
 				return err
 			}
 		} else {
-			return r.waitPodSucceeded(ctx, source.Namespace, podName)
+			if err := r.waitPodSucceeded(ctx, source.Namespace, podName); err != nil {
+				return err
+			}
+			return r.cleanupSyncPod(ctx, source.Namespace, podName)
 		}
 	} else if !apierrors.IsNotFound(err) {
 		return err
@@ -380,7 +383,21 @@ func (r *Runner) runSync(ctx context.Context, source *corev1.PersistentVolumeCla
 		return err
 	}
 	fmt.Fprintf(r.out, "started %s sync pod/%s\n", phase, podName)
-	return r.waitPodSucceeded(ctx, source.Namespace, podName)
+	if err := r.waitPodSucceeded(ctx, source.Namespace, podName); err != nil {
+		return err
+	}
+	return r.cleanupSyncPod(ctx, source.Namespace, podName)
+}
+
+func (r *Runner) cleanupSyncPod(ctx context.Context, namespace, name string) error {
+	err := r.client.CoreV1().Pods(namespace).Delete(ctx, name, metav1.DeleteOptions{})
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return r.waitPodGone(ctx, namespace, name)
 }
 
 func (r *Runner) cutover(ctx context.Context, source *corev1.PersistentVolumeClaim) error {
