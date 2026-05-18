@@ -295,6 +295,10 @@ func (r *Runner) restoreWorkload(ctx context.Context, pvc *corev1.PersistentVolu
 			return err
 		}
 	case "StatefulSet":
+		if r.deferredStatefulSetRestore != nil {
+			r.deferStatefulSetRestore(record, pvc.Namespace, pvc.Name)
+			return nil
+		}
 		if err := r.scaleStatefulSet(ctx, record.Namespace, record.Name, record.OriginalReplicas); err != nil {
 			return err
 		}
@@ -309,6 +313,49 @@ func (r *Runner) restoreWorkload(ctx context.Context, pvc *corev1.PersistentVolu
 		return err
 	}
 	return r.patchPVCAnnotations(ctx, pvc, map[string]string{AnnState: StateRestored})
+}
+
+func (r *Runner) deferStatefulSetRestore(record QuiesceRecord, namespace, name string) {
+	key := record.Namespace + "/" + record.Name
+	deferred := r.deferredStatefulSetRestore[key]
+	if deferred == nil {
+		deferred = &deferredStatefulSetRestore{}
+		r.deferredStatefulSetRestore[key] = deferred
+	}
+	if record.OriginalReplicas > deferred.maxReplicas {
+		deferred.maxReplicas = record.OriginalReplicas
+	}
+	deferred.records = append(deferred.records, record)
+	deferred.pvcs = append(deferred.pvcs, pvcRef{namespace: namespace, name: name})
+}
+
+func (r *Runner) restoreDeferredStatefulSets(ctx context.Context) error {
+	if len(r.deferredStatefulSetRestore) == 0 {
+		return nil
+	}
+	for _, deferred := range r.deferredStatefulSetRestore {
+		record := deferred.records[0]
+		if err := r.scaleStatefulSet(ctx, record.Namespace, record.Name, deferred.maxReplicas); err != nil {
+			return err
+		}
+	}
+	for _, deferred := range r.deferredStatefulSetRestore {
+		for _, record := range deferred.records {
+			if err := r.waitWorkloadRestored(ctx, record); err != nil {
+				return err
+			}
+		}
+		for _, ref := range deferred.pvcs {
+			pvc, err := r.client.CoreV1().PersistentVolumeClaims(ref.namespace).Get(ctx, ref.name, metav1.GetOptions{})
+			if err != nil {
+				return err
+			}
+			if err := r.patchPVCAnnotations(ctx, pvc, map[string]string{AnnState: StateRestored}); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func (r *Runner) scaleDeployment(ctx context.Context, namespace, name string, replicas int32) error {

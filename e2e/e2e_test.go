@@ -94,6 +94,39 @@ func TestMigrations(t *testing.T) {
 	}
 }
 
+func TestThreeReplicaStatefulSetEmptyPVCs(t *testing.T) {
+	if os.Getenv("SCMIGRATE_E2E") != "1" {
+		t.Skip("set SCMIGRATE_E2E=1 to run kind-backed e2e tests")
+	}
+	requireEnv(t, "KUBECONFIG")
+	requireEnv(t, "SCMIGRATE_BIN")
+	image := requireEnv(t, "SCMIGRATE_RUNNER_IMAGE")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	defer cancel()
+
+	applyYAML(t, ctx, storageClassesYAML())
+
+	runID := fmt.Sprintf("%d", time.Now().UnixNano())
+	namespace := "scmigrate-e2e-statefulset-3"
+	createNamespace(t, ctx, namespace)
+	t.Cleanup(func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		_ = kubectl(cleanupCtx, "delete", "namespace", namespace, "--ignore-not-found=true")
+	})
+
+	applyYAML(t, ctx, threeReplicaStatefulSetYAML(namespace, runID, image))
+	kubectlOK(t, ctx, "rollout", "status", "-n", namespace, "statefulset/app", "--timeout=240s")
+
+	runScmigrate(t, ctx, namespace, "statefulset-empty", runID, image)
+
+	kubectlOK(t, ctx, "rollout", "status", "-n", namespace, "statefulset/app", "--timeout=240s")
+	for i := 0; i < 3; i++ {
+		assertPVC(t, ctx, namespace, fmt.Sprintf("data-app-%d", i))
+	}
+}
+
 func requireEnv(t *testing.T, key string) string {
 	t.Helper()
 	value := os.Getenv(key)
@@ -366,5 +399,57 @@ spec:
       - name: data
         persistentVolumeClaim:
           claimName: data
+`, namespace, runID, image, sourceStorageClass)
+}
+
+func threeReplicaStatefulSetYAML(namespace, runID, image string) string {
+	return fmt.Sprintf(`
+apiVersion: v1
+kind: Service
+metadata:
+  name: app
+  namespace: %[1]s
+spec:
+  clusterIP: None
+  selector:
+    app: scmigrate-e2e-statefulset-empty
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: app
+  namespace: %[1]s
+spec:
+  serviceName: app
+  replicas: 3
+  selector:
+    matchLabels:
+      app: scmigrate-e2e-statefulset-empty
+  template:
+    metadata:
+      labels:
+        app: scmigrate-e2e-statefulset-empty
+    spec:
+      terminationGracePeriodSeconds: 0
+      containers:
+      - name: app
+        image: %[3]s
+        imagePullPolicy: IfNotPresent
+        command: ["sh", "-c", "trap 'exit 0' TERM INT; sleep 86400 & wait"]
+        volumeMounts:
+        - name: data
+          mountPath: /data
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+      labels:
+        scmigrate-e2e: statefulset-empty
+        scmigrate-e2e-run: "%[2]s"
+    spec:
+      accessModes: [ReadWriteOnce]
+      storageClassName: %[4]s
+      resources:
+        requests:
+          storage: 64Mi
 `, namespace, runID, image, sourceStorageClass)
 }
