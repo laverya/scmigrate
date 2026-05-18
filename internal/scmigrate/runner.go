@@ -20,22 +20,10 @@ import (
 )
 
 type Runner struct {
-	opts                       Options
-	client                     kubernetes.Interface
-	out                        io.Writer
-	namespace                  string
-	deferredStatefulSetRestore map[string]*deferredStatefulSetRestore
-}
-
-type deferredStatefulSetRestore struct {
-	maxReplicas int32
-	records     []QuiesceRecord
-	pvcs        []pvcRef
-}
-
-type pvcRef struct {
+	opts      Options
+	client    kubernetes.Interface
+	out       io.Writer
 	namespace string
-	name      string
 }
 
 func NewRunner(opts Options, out io.Writer) (*Runner, error) {
@@ -111,18 +99,13 @@ func (r *Runner) Run(ctx context.Context) error {
 		}
 	}
 
-	r.deferredStatefulSetRestore = map[string]*deferredStatefulSetRestore{}
-	defer func() {
-		r.deferredStatefulSetRestore = nil
-	}()
-
 	for _, migration := range migrations {
 		fmt.Fprintf(r.out, "Migrating %s/%s\n", migration.Source.Namespace, migration.Source.Name)
 		if err := r.migrate(ctx, migration); err != nil {
 			return fmt.Errorf("%s/%s: %w", migration.Source.Namespace, migration.Source.Name, err)
 		}
 	}
-	return r.restoreDeferredStatefulSets(ctx)
+	return nil
 }
 
 func (r *Runner) migrate(ctx context.Context, migration *Migration) error {

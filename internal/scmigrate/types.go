@@ -49,6 +49,7 @@ type QuiesceRecord struct {
 	OriginalReplicas  int32                          `json:"originalReplicas"`
 	PodName           string                         `json:"podName"`
 	NodeName          string                         `json:"nodeName,omitempty"`
+	StatefulSet       *appsv1.StatefulSet            `json:"statefulSet,omitempty"`
 	DaemonSetStrategy appsv1.DaemonSetUpdateStrategy `json:"daemonSetStrategy,omitempty"`
 	DaemonSetAffinity *corev1.Affinity               `json:"daemonSetAffinity,omitempty"`
 }

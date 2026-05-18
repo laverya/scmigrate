@@ -137,14 +137,55 @@ func (r *Runner) quiesceStatefulSet(ctx context.Context, pod *corev1.Pod, sts *a
 		return QuiesceRecord{}, fmt.Errorf("cannot infer ordinal for statefulset pod/%s", pod.Name)
 	}
 	if ordinal != replicas-1 {
-		return QuiesceRecord{}, fmt.Errorf("statefulset/%s can quiesce one pod safely only at highest ordinal; pod/%s is ordinal %d, current highest is %d. Migrate this StatefulSet in descending ordinal order", sts.Name, pod.Name, ordinal, replicas-1)
+		if replicas <= 1 {
+			return QuiesceRecord{}, fmt.Errorf("statefulset/%s can quiesce one pod safely only at highest ordinal; pod/%s is ordinal %d, current highest is %d. Migrate this StatefulSet in descending ordinal order", sts.Name, pod.Name, ordinal, replicas-1)
+		}
 	}
 	record := QuiesceRecord{Kind: "StatefulSet", Name: sts.Name, Namespace: pod.Namespace, OriginalReplicas: replicas, PodName: pod.Name}
 	if r.opts.DryRun {
+		if replicas > 1 {
+			fmt.Fprintf(r.out, "dry-run: orphan statefulset/%s, delete pod/%s, recreate statefulset/%s\n", sts.Name, pod.Name, sts.Name)
+			return record, nil
+		}
 		fmt.Fprintf(r.out, "dry-run: scale statefulset/%s from %d to %d\n", sts.Name, replicas, replicas-1)
 		return record, nil
 	}
+	if replicas > 1 {
+		record.StatefulSet = statefulSetForRecreate(sts)
+		return record, r.orphanStatefulSetAndDeletePod(ctx, pod, sts)
+	}
 	return record, r.scaleStatefulSet(ctx, pod.Namespace, sts.Name, replicas-1)
+}
+
+func (r *Runner) orphanStatefulSetAndDeletePod(ctx context.Context, pod *corev1.Pod, sts *appsv1.StatefulSet) error {
+	propagation := metav1.DeletePropagationOrphan
+	err := r.client.AppsV1().StatefulSets(sts.Namespace).Delete(ctx, sts.Name, metav1.DeleteOptions{PropagationPolicy: &propagation})
+	if err != nil && !apierrors.IsNotFound(err) {
+		return err
+	}
+	if err := r.waitStatefulSetGone(ctx, sts.Namespace, sts.Name); err != nil {
+		return err
+	}
+	err = r.client.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{})
+	if err != nil && !apierrors.IsNotFound(err) {
+		return err
+	}
+	return nil
+}
+
+func statefulSetForRecreate(sts *appsv1.StatefulSet) *appsv1.StatefulSet {
+	out := sts.DeepCopy()
+	out.TypeMeta = metav1.TypeMeta{APIVersion: "apps/v1", Kind: "StatefulSet"}
+	out.ObjectMeta.ResourceVersion = ""
+	out.ObjectMeta.UID = ""
+	out.ObjectMeta.Generation = 0
+	out.ObjectMeta.CreationTimestamp = metav1.Time{}
+	out.ObjectMeta.DeletionTimestamp = nil
+	out.ObjectMeta.DeletionGracePeriodSeconds = nil
+	out.ObjectMeta.ManagedFields = nil
+	out.ObjectMeta.OwnerReferences = nil
+	out.Status = appsv1.StatefulSetStatus{}
+	return out
 }
 
 func (r *Runner) quiesceDaemonSet(ctx context.Context, pod *corev1.Pod, ds *appsv1.DaemonSet) (QuiesceRecord, error) {
@@ -295,12 +336,14 @@ func (r *Runner) restoreWorkload(ctx context.Context, pvc *corev1.PersistentVolu
 			return err
 		}
 	case "StatefulSet":
-		if r.deferredStatefulSetRestore != nil {
-			r.deferStatefulSetRestore(record, pvc.Namespace, pvc.Name)
-			return nil
-		}
-		if err := r.scaleStatefulSet(ctx, record.Namespace, record.Name, record.OriginalReplicas); err != nil {
-			return err
+		if record.StatefulSet != nil {
+			if err := r.restoreOrphanedStatefulSet(ctx, record); err != nil {
+				return err
+			}
+		} else {
+			if err := r.scaleStatefulSet(ctx, record.Namespace, record.Name, record.OriginalReplicas); err != nil {
+				return err
+			}
 		}
 	case "DaemonSet":
 		if err := r.restoreDaemonSet(ctx, record); err != nil {
@@ -315,45 +358,11 @@ func (r *Runner) restoreWorkload(ctx context.Context, pvc *corev1.PersistentVolu
 	return r.patchPVCAnnotations(ctx, pvc, map[string]string{AnnState: StateRestored})
 }
 
-func (r *Runner) deferStatefulSetRestore(record QuiesceRecord, namespace, name string) {
-	key := record.Namespace + "/" + record.Name
-	deferred := r.deferredStatefulSetRestore[key]
-	if deferred == nil {
-		deferred = &deferredStatefulSetRestore{}
-		r.deferredStatefulSetRestore[key] = deferred
-	}
-	if record.OriginalReplicas > deferred.maxReplicas {
-		deferred.maxReplicas = record.OriginalReplicas
-	}
-	deferred.records = append(deferred.records, record)
-	deferred.pvcs = append(deferred.pvcs, pvcRef{namespace: namespace, name: name})
-}
-
-func (r *Runner) restoreDeferredStatefulSets(ctx context.Context) error {
-	if len(r.deferredStatefulSetRestore) == 0 {
-		return nil
-	}
-	for _, deferred := range r.deferredStatefulSetRestore {
-		record := deferred.records[0]
-		if err := r.scaleStatefulSet(ctx, record.Namespace, record.Name, deferred.maxReplicas); err != nil {
-			return err
-		}
-	}
-	for _, deferred := range r.deferredStatefulSetRestore {
-		for _, record := range deferred.records {
-			if err := r.waitWorkloadRestored(ctx, record); err != nil {
-				return err
-			}
-		}
-		for _, ref := range deferred.pvcs {
-			pvc, err := r.client.CoreV1().PersistentVolumeClaims(ref.namespace).Get(ctx, ref.name, metav1.GetOptions{})
-			if err != nil {
-				return err
-			}
-			if err := r.patchPVCAnnotations(ctx, pvc, map[string]string{AnnState: StateRestored}); err != nil {
-				return err
-			}
-		}
+func (r *Runner) restoreOrphanedStatefulSet(ctx context.Context, record QuiesceRecord) error {
+	sts := statefulSetForRecreate(record.StatefulSet)
+	_, err := r.client.AppsV1().StatefulSets(sts.Namespace).Create(ctx, sts, metav1.CreateOptions{})
+	if err != nil && !apierrors.IsAlreadyExists(err) {
+		return err
 	}
 	return nil
 }
@@ -377,6 +386,16 @@ func (r *Runner) scaleStatefulSet(ctx context.Context, namespace, name string, r
 	data, _ := json.Marshal(payload)
 	_, err := r.client.AppsV1().StatefulSets(namespace).Patch(ctx, name, types.MergePatchType, data, metav1.PatchOptions{})
 	return err
+}
+
+func (r *Runner) waitStatefulSetGone(ctx context.Context, namespace, name string) error {
+	return wait(ctx, 10*time.Minute, func() (bool, error) {
+		_, err := r.client.AppsV1().StatefulSets(namespace).Get(ctx, name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			return true, nil
+		}
+		return false, err
+	})
 }
 
 func (r *Runner) restoreDaemonSet(ctx context.Context, record QuiesceRecord) error {
