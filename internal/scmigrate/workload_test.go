@@ -13,6 +13,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
 )
 
 func testContext(t *testing.T) context.Context {
@@ -139,6 +140,9 @@ func TestQuiesceSharedDeploymentPVCScalesDeploymentToZeroOnce(t *testing.T) {
 	if !reflect.DeepEqual(record.PodNames, []string{"app-1", "app-2", "app-3"}) {
 		t.Fatalf("unexpected pod names: %#v", record.PodNames)
 	}
+	if err := runner.applyQuiesceRecords(testContext(t), records); err != nil {
+		t.Fatalf("applyQuiesceRecords returned error: %v", err)
+	}
 	got, err := client.AppsV1().Deployments("default").Get(testContext(t), "app", metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("get deployment: %v", err)
@@ -181,6 +185,9 @@ func TestQuiescePVCSharedByMultipleParentsScalesEveryParent(t *testing.T) {
 	}
 	if records[1].Name != "worker" || records[1].OriginalReplicas != 1 {
 		t.Fatalf("unexpected worker record: %#v", records[1])
+	}
+	if err := runner.applyQuiesceRecords(testContext(t), records); err != nil {
+		t.Fatalf("applyQuiesceRecords returned error: %v", err)
 	}
 	for _, name := range []string{"api", "worker"} {
 		deploy, err := client.AppsV1().Deployments("default").Get(testContext(t), name, metav1.GetOptions{})
@@ -350,6 +357,9 @@ func TestQuiesceStandalonePodsDeletesPods(t *testing.T) {
 	if record.Kind != "Pod" || record.PodName != "standalone-a" || !reflect.DeepEqual(record.PodNames, []string{"standalone-a", "standalone-b"}) {
 		t.Fatalf("unexpected standalone pod record: %#v", record)
 	}
+	if err := runner.applyQuiesceRecord(ctx, record); err != nil {
+		t.Fatalf("applyQuiesceRecord returned error: %v", err)
+	}
 	for _, name := range []string{"standalone-a", "standalone-b"} {
 		if _, err := client.CoreV1().Pods("default").Get(ctx, name, metav1.GetOptions{}); err == nil {
 			t.Fatalf("pod/%s still exists after quiesce", name)
@@ -376,6 +386,9 @@ func TestQuiesceReplicaSetConsumersScalesReplicaSetToZero(t *testing.T) {
 	}
 	if record.Kind != "ReplicaSet" || record.Name != "worker-rs" || record.OriginalReplicas != 2 {
 		t.Fatalf("unexpected replicaset record: %#v", record)
+	}
+	if err := runner.applyQuiesceRecord(ctx, record); err != nil {
+		t.Fatalf("applyQuiesceRecord returned error: %v", err)
 	}
 	got, err := client.AppsV1().ReplicaSets("default").Get(ctx, "worker-rs", metav1.GetOptions{})
 	if err != nil {
@@ -406,6 +419,9 @@ func TestQuiesceStatefulSetConsumersScalesSharedPVCToZero(t *testing.T) {
 	if record.Kind != "StatefulSet" || record.OriginalReplicas != 2 || !reflect.DeepEqual(record.PodNames, []string{"db-0", "db-1"}) {
 		t.Fatalf("unexpected statefulset record: %#v", record)
 	}
+	if err := runner.applyQuiesceRecord(ctx, record); err != nil {
+		t.Fatalf("applyQuiesceRecord returned error: %v", err)
+	}
 	got, err := client.AppsV1().StatefulSets("default").Get(ctx, "db", metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("get statefulset: %v", err)
@@ -433,6 +449,9 @@ func TestQuiesceStatefulSetHighestOrdinalOrphansAndRestoreRecreates(t *testing.T
 	if record.Kind != "StatefulSet" || record.OriginalReplicas != 3 || record.StatefulSet == nil {
 		t.Fatalf("unexpected statefulset record: %#v", record)
 	}
+	if err := runner.applyQuiesceRecord(ctx, record); err != nil {
+		t.Fatalf("applyQuiesceRecord returned error: %v", err)
+	}
 	if _, err := client.AppsV1().StatefulSets("default").Get(ctx, "db", metav1.GetOptions{}); err == nil {
 		t.Fatal("statefulset still exists after orphaning")
 	}
@@ -452,6 +471,96 @@ func TestQuiesceStatefulSetHighestOrdinalOrphansAndRestoreRecreates(t *testing.T
 	}
 	if restored.Spec.Replicas == nil || *restored.Spec.Replicas != 3 {
 		t.Fatalf("restored statefulset replicas = %v, want 3", restored.Spec.Replicas)
+	}
+}
+
+func TestQuiesceStoresStatefulSetRecordBeforeDeletingStatefulSet(t *testing.T) {
+	ctx := testContext(t)
+	source := boundPVC("default", "data", "source-pv", "old-sc")
+	source.Annotations[AnnDestinationPVC] = "dest"
+	dest := boundPVC("default", "dest", "dest-pv", "new-sc")
+	sts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "db", Namespace: "default", UID: "sts-uid"},
+		Spec:       appsv1.StatefulSetSpec{Replicas: int32Ptr(3)},
+	}
+	pod := testPod("default", "db-2", "data", "node-a", controllerRef("StatefulSet", "db"))
+	client := fake.NewSimpleClientset(source, dest, sts, pod)
+	runner := &Runner{client: client, out: io.Discard}
+
+	if err := runner.quiesce(ctx, source); err != nil {
+		t.Fatalf("quiesce returned error: %v", err)
+	}
+	deleteIndex := actionIndex(client.Actions(), "delete", "statefulsets")
+	if deleteIndex < 0 {
+		t.Fatalf("statefulset was not deleted; actions: %#v", client.Actions())
+	}
+	patchesBeforeDelete := 0
+	for i, action := range client.Actions() {
+		if i >= deleteIndex {
+			break
+		}
+		if action.Matches("patch", "persistentvolumeclaims") {
+			patchesBeforeDelete++
+		}
+	}
+	if patchesBeforeDelete < 2 {
+		t.Fatalf("source and destination PVCs were not patched before StatefulSet delete; actions: %#v", client.Actions())
+	}
+	for _, name := range []string{"data", "dest"} {
+		pvc, err := client.CoreV1().PersistentVolumeClaims("default").Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("get pvc/%s: %v", name, err)
+		}
+		records, err := quiesceRecordsFromAnnotation(pvc.Annotations[AnnQuiesce])
+		if err != nil {
+			t.Fatalf("decode quiesce records on pvc/%s: %v", name, err)
+		}
+		if len(records) != 1 || records[0].StatefulSet == nil {
+			t.Fatalf("pvc/%s does not contain persisted StatefulSet record: %#v", name, records)
+		}
+	}
+}
+
+func TestQuiesceReusesStoredRecordWhenConsumersAlreadyGone(t *testing.T) {
+	ctx := testContext(t)
+	sts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "db", Namespace: "default"},
+		Spec:       appsv1.StatefulSetSpec{Replicas: int32Ptr(3)},
+	}
+	record := QuiesceRecord{
+		Kind:             "StatefulSet",
+		Name:             "db",
+		Namespace:        "default",
+		OriginalReplicas: 3,
+		PodName:          "db-2",
+		PodNames:         []string{"db-2"},
+		StatefulSet:      statefulSetForRecreate(sts),
+	}
+	raw, err := json.Marshal([]QuiesceRecord{record})
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := boundPVC("default", "data", "source-pv", "old-sc")
+	source.Annotations[AnnDestinationPVC] = "dest"
+	source.Annotations[AnnQuiesce] = string(raw)
+	dest := boundPVC("default", "dest", "dest-pv", "new-sc")
+	runner := &Runner{client: fake.NewSimpleClientset(source, dest), out: io.Discard}
+
+	if err := runner.quiesce(ctx, source); err != nil {
+		t.Fatalf("quiesce returned error: %v", err)
+	}
+	for _, name := range []string{"data", "dest"} {
+		pvc, err := runner.client.CoreV1().PersistentVolumeClaims("default").Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("get pvc/%s: %v", name, err)
+		}
+		records, err := quiesceRecordsFromAnnotation(pvc.Annotations[AnnQuiesce])
+		if err != nil {
+			t.Fatalf("decode quiesce records on pvc/%s: %v", name, err)
+		}
+		if len(records) != 1 || records[0].Kind != "StatefulSet" || records[0].StatefulSet == nil {
+			t.Fatalf("quiesce overwrote stored StatefulSet record on pvc/%s: %#v", name, records)
+		}
 	}
 }
 
@@ -491,6 +600,9 @@ func TestQuiesceDaemonSetConsumersPatchesSchedulingAndDeletesPods(t *testing.T) 
 	}
 	if record.Kind != "DaemonSet" || !reflect.DeepEqual(record.NodeNames, []string{"node-a", "node-b"}) {
 		t.Fatalf("unexpected daemonset record: %#v", record)
+	}
+	if err := runner.applyQuiesceRecord(ctx, record); err != nil {
+		t.Fatalf("applyQuiesceRecord returned error: %v", err)
 	}
 	patched, err := client.AppsV1().DaemonSets("default").Get(ctx, "agent", metav1.GetOptions{})
 	if err != nil {
@@ -734,6 +846,15 @@ func int32Ptr(value int32) *int32 {
 
 func boolPtr(value bool) *bool {
 	return &value
+}
+
+func actionIndex(actions []ktesting.Action, verb, resource string) int {
+	for i, action := range actions {
+		if action.Matches(verb, resource) {
+			return i
+		}
+	}
+	return -1
 }
 
 func TestDaemonSetPodReadyOnNodeFindsReadyReplacement(t *testing.T) {

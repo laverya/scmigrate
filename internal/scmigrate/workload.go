@@ -79,15 +79,33 @@ func podNodeNames(pods []corev1.Pod) []string {
 }
 
 func (r *Runner) quiesce(ctx context.Context, pvc *corev1.PersistentVolumeClaim) error {
-	consumers, err := r.pvcConsumers(ctx, pvc)
-	if err != nil {
+	current, err := r.client.CoreV1().PersistentVolumeClaims(pvc.Namespace).Get(ctx, pvc.Name, metav1.GetOptions{})
+	if err == nil {
+		pvc = current
+	} else if !apierrors.IsNotFound(err) {
 		return err
 	}
-	records, err := r.quiesceConsumerGroups(ctx, pvc, consumers)
-	if err != nil {
-		return err
+
+	var records []QuiesceRecord
+	if raw := pvc.Annotations[AnnQuiesce]; raw != "" {
+		records, err = quiesceRecordsFromAnnotation(raw)
+		if err != nil {
+			return err
+		}
+	} else {
+		consumers, err := r.pvcConsumers(ctx, pvc)
+		if err != nil {
+			return err
+		}
+		records, err = r.quiesceConsumerGroups(ctx, pvc, consumers)
+		if err != nil {
+			return err
+		}
 	}
 	if err := r.storeQuiesceRecords(ctx, pvc, records); err != nil {
+		return err
+	}
+	if err := r.applyQuiesceRecords(ctx, records); err != nil {
 		return err
 	}
 	if r.opts.DryRun {
@@ -151,16 +169,6 @@ func (r *Runner) quiesceWorkloadGroup(ctx context.Context, pvc *corev1.Persisten
 func (r *Runner) quiesceStandalonePods(ctx context.Context, ref WorkloadRef, pods []corev1.Pod) (QuiesceRecord, error) {
 	names := podNames(pods)
 	record := QuiesceRecord{Kind: "Pod", Name: names[0], Namespace: ref.Namespace, PodName: names[0], PodNames: names}
-	if r.opts.DryRun {
-		fmt.Fprintf(r.out, "dry-run: delete standalone pod(s) %s\n", strings.Join(names, ","))
-		return record, nil
-	}
-	for _, pod := range pods {
-		err := r.client.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{})
-		if err != nil && !apierrors.IsNotFound(err) {
-			return record, err
-		}
-	}
 	return record, nil
 }
 
@@ -178,11 +186,7 @@ func (r *Runner) quiesceDeploymentConsumers(ctx context.Context, pvc *corev1.Per
 	}
 	names := podNames(pods)
 	record := QuiesceRecord{Kind: "Deployment", Name: deploy.Name, Namespace: ref.Namespace, OriginalReplicas: replicas, PodName: names[0], PodNames: names}
-	if r.opts.DryRun {
-		fmt.Fprintf(r.out, "dry-run: scale deployment/%s from %d to 0 for %d pod(s) using pvc/%s\n", deploy.Name, replicas, len(pods), pvc.Name)
-		return record, nil
-	}
-	return record, r.scaleDeployment(ctx, ref.Namespace, deploy.Name, 0)
+	return record, nil
 }
 
 func (r *Runner) quiesceReplicaSet(ctx context.Context, pod *corev1.Pod, rs *appsv1.ReplicaSet) (QuiesceRecord, error) {
@@ -207,11 +211,7 @@ func (r *Runner) quiesceReplicaSetObject(ctx context.Context, ref WorkloadRef, p
 	}
 	names := podNames(pods)
 	record := QuiesceRecord{Kind: "ReplicaSet", Name: rs.Name, Namespace: ref.Namespace, OriginalReplicas: replicas, PodName: names[0], PodNames: names}
-	if r.opts.DryRun {
-		fmt.Fprintf(r.out, "dry-run: scale replicaset/%s from %d to 0 for %d pod(s)\n", rs.Name, replicas, len(pods))
-		return record, nil
-	}
-	return record, r.scaleReplicaSet(ctx, ref.Namespace, rs.Name, 0)
+	return record, nil
 }
 
 func (r *Runner) quiesceStatefulSetConsumers(ctx context.Context, ref WorkloadRef, pods []corev1.Pod) (QuiesceRecord, error) {
@@ -231,11 +231,7 @@ func (r *Runner) quiesceStatefulSetConsumers(ctx context.Context, ref WorkloadRe
 	}
 	names := podNames(pods)
 	record := QuiesceRecord{Kind: "StatefulSet", Name: sts.Name, Namespace: ref.Namespace, OriginalReplicas: replicas, PodName: names[0], PodNames: names}
-	if r.opts.DryRun {
-		fmt.Fprintf(r.out, "dry-run: scale statefulset/%s from %d to 0 for %d pod(s)\n", sts.Name, replicas, len(pods))
-		return record, nil
-	}
-	return record, r.scaleStatefulSet(ctx, ref.Namespace, sts.Name, 0)
+	return record, nil
 }
 
 func (r *Runner) quiesceStatefulSet(ctx context.Context, pod *corev1.Pod, sts *appsv1.StatefulSet) (QuiesceRecord, error) {
@@ -251,19 +247,10 @@ func (r *Runner) quiesceStatefulSet(ctx context.Context, pod *corev1.Pod, sts *a
 		return QuiesceRecord{}, fmt.Errorf("statefulset/%s can quiesce one pod safely only at highest ordinal; pod/%s is ordinal %d, current highest is %d. Migrate this StatefulSet in descending ordinal order", sts.Name, pod.Name, ordinal, replicas-1)
 	}
 	record := QuiesceRecord{Kind: "StatefulSet", Name: sts.Name, Namespace: pod.Namespace, OriginalReplicas: replicas, PodName: pod.Name, PodNames: []string{pod.Name}}
-	if r.opts.DryRun {
-		if replicas > 1 {
-			fmt.Fprintf(r.out, "dry-run: orphan statefulset/%s, delete pod/%s, recreate statefulset/%s\n", sts.Name, pod.Name, sts.Name)
-			return record, nil
-		}
-		fmt.Fprintf(r.out, "dry-run: scale statefulset/%s from %d to %d\n", sts.Name, replicas, replicas-1)
-		return record, nil
-	}
 	if replicas > 1 {
 		record.StatefulSet = statefulSetForRecreate(sts)
-		return record, r.orphanStatefulSetAndDeletePod(ctx, pod, sts)
 	}
-	return record, r.scaleStatefulSet(ctx, pod.Namespace, sts.Name, replicas-1)
+	return record, nil
 }
 
 func (r *Runner) orphanStatefulSetAndDeletePod(ctx context.Context, pod *corev1.Pod, sts *appsv1.StatefulSet) error {
@@ -326,20 +313,116 @@ func (r *Runner) quiesceDaemonSetObject(ctx context.Context, ref WorkloadRef, po
 		DaemonSetStrategy: ds.Spec.UpdateStrategy,
 		DaemonSetAffinity: ds.Spec.Template.Spec.Affinity,
 	}
-	if r.opts.DryRun {
-		fmt.Fprintf(r.out, "dry-run: exclude node(s) %s from daemonset/%s and delete %d pod(s)\n", strings.Join(nodes, ","), ds.Name, len(pods))
-		return record, nil
-	}
-	if err := r.excludeDaemonSetNodes(ctx, ds, nodes); err != nil {
-		return record, err
-	}
-	for _, pod := range pods {
-		err := r.client.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{})
-		if err != nil && !apierrors.IsNotFound(err) {
-			return record, err
+	return record, nil
+}
+
+func (r *Runner) applyQuiesceRecords(ctx context.Context, records []QuiesceRecord) error {
+	for _, record := range records {
+		if err := r.applyQuiesceRecord(ctx, record); err != nil {
+			return err
 		}
 	}
-	return record, nil
+	return nil
+}
+
+func (r *Runner) applyQuiesceRecord(ctx context.Context, record QuiesceRecord) error {
+	switch record.Kind {
+	case "None":
+		return nil
+	case "Pod":
+		names := recordPodNames(record)
+		if r.opts.DryRun {
+			fmt.Fprintf(r.out, "dry-run: delete standalone pod(s) %s\n", strings.Join(names, ","))
+			return nil
+		}
+		for _, name := range names {
+			err := r.client.CoreV1().Pods(record.Namespace).Delete(ctx, name, metav1.DeleteOptions{})
+			if err != nil && !apierrors.IsNotFound(err) {
+				return err
+			}
+		}
+	case "Deployment":
+		if r.opts.DryRun {
+			fmt.Fprintf(r.out, "dry-run: scale deployment/%s from %d to 0 for %d pod(s)\n", record.Name, record.OriginalReplicas, len(recordPodNames(record)))
+			return nil
+		}
+		return r.scaleDeployment(ctx, record.Namespace, record.Name, 0)
+	case "ReplicaSet":
+		if r.opts.DryRun {
+			fmt.Fprintf(r.out, "dry-run: scale replicaset/%s from %d to 0 for %d pod(s)\n", record.Name, record.OriginalReplicas, len(recordPodNames(record)))
+			return nil
+		}
+		return r.scaleReplicaSet(ctx, record.Namespace, record.Name, 0)
+	case "StatefulSet":
+		if record.StatefulSet != nil {
+			pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: firstPodName(record), Namespace: record.Namespace}}
+			if r.opts.DryRun {
+				fmt.Fprintf(r.out, "dry-run: orphan statefulset/%s, delete pod/%s, recreate statefulset/%s\n", record.Name, pod.Name, record.Name)
+				return nil
+			}
+			return r.orphanStatefulSetAndDeletePod(ctx, pod, record.StatefulSet)
+		}
+		targetReplicas := int32(0)
+		if len(recordPodNames(record)) <= 1 && record.OriginalReplicas > 0 {
+			targetReplicas = record.OriginalReplicas - 1
+		}
+		if r.opts.DryRun {
+			fmt.Fprintf(r.out, "dry-run: scale statefulset/%s from %d to %d\n", record.Name, record.OriginalReplicas, targetReplicas)
+			return nil
+		}
+		return r.scaleStatefulSet(ctx, record.Namespace, record.Name, targetReplicas)
+	case "DaemonSet":
+		nodes := recordNodeNames(record)
+		names := recordPodNames(record)
+		if r.opts.DryRun {
+			fmt.Fprintf(r.out, "dry-run: exclude node(s) %s from daemonset/%s and delete %d pod(s)\n", strings.Join(nodes, ","), record.Name, len(names))
+			return nil
+		}
+		ds, err := r.client.AppsV1().DaemonSets(record.Namespace).Get(ctx, record.Name, metav1.GetOptions{})
+		if err != nil {
+			return err
+		}
+		if err := r.excludeDaemonSetNodes(ctx, ds, nodes); err != nil {
+			return err
+		}
+		for _, name := range names {
+			err := r.client.CoreV1().Pods(record.Namespace).Delete(ctx, name, metav1.DeleteOptions{})
+			if err != nil && !apierrors.IsNotFound(err) {
+				return err
+			}
+		}
+	default:
+		return fmt.Errorf("unsupported quiesce record kind %q", record.Kind)
+	}
+	return nil
+}
+
+func recordPodNames(record QuiesceRecord) []string {
+	if len(record.PodNames) > 0 {
+		return record.PodNames
+	}
+	if record.PodName != "" {
+		return []string{record.PodName}
+	}
+	return nil
+}
+
+func recordNodeNames(record QuiesceRecord) []string {
+	if len(record.NodeNames) > 0 {
+		return record.NodeNames
+	}
+	if record.NodeName != "" {
+		return []string{record.NodeName}
+	}
+	return nil
+}
+
+func firstPodName(record QuiesceRecord) string {
+	names := recordPodNames(record)
+	if len(names) == 0 {
+		return ""
+	}
+	return names[0]
 }
 
 func (r *Runner) excludeDaemonSetNode(ctx context.Context, ds *appsv1.DaemonSet, nodeName string) error {
