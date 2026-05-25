@@ -75,7 +75,8 @@ For each matching bound PVC, the plugin:
 2. Creates a temporary destination PVC using the target storage class.
 3. Starts an rsync pod mounting the source read-only and the destination
    read-write while the workload remains online.
-4. Quiesces only the single pod that is using that PVC.
+4. Quiesces every running pod that is using that PVC by grouping consumers by
+   their owning workload and scaling/deleting each affected parent once.
 5. Runs a final rsync pass.
 6. Sets both the source PV and destination PV reclaim policies to `Retain`.
 7. Deletes the original and temporary PVCs.
@@ -95,29 +96,29 @@ the same place as the source consumer.
 
 ## Avoiding Full Service Outages
 
-Final sync requires the PVC to have no active writers. By default, `scmigrate`
-refuses to finalize a PVC mounted by more than one running pod.
+Final sync requires the PVC to have no active writers. `scmigrate` determines
+all running pods that mount each selected PVC, resolves their owning workload,
+and quiesces every affected workload before the final sync and cutover.
 
-For `Deployment` workloads, the plugin annotates pods with
-`controller.kubernetes.io/pod-deletion-cost` and scales the deployment down by
-one replica so Kubernetes removes the pod that owns the PVC being migrated. It
-scales the deployment back after the cutover.
+For `Deployment` and standalone `ReplicaSet` workloads, the plugin scales each
+affected parent to zero once per PVC and restores the original replica count
+after cutover. This covers PVCs shared by multiple replicas and PVCs mounted by
+multiple parent resources.
 
-For `StatefulSet` workloads, Kubernetes can safely remove only the highest
-ordinal by scaling down one replica. The plugin sorts migrations by trailing
-ordinal in descending order and refuses a lower ordinal until it is the highest
-active ordinal. This keeps one StatefulSet pod down at a time.
+For `StatefulSet` workloads using ordinary `volumeClaimTemplates`, each PVC is
+usually consumed by one pod. The plugin sorts those PVCs by trailing ordinal in
+descending order, temporarily orphans the StatefulSet, deletes the consumer pod,
+and recreates the StatefulSet after cutover. This keeps one StatefulSet pod down
+at a time. If a StatefulSet shares one PVC across multiple pods, the plugin
+scales the StatefulSet to zero and restores the original replica count after
+cutover.
 
 For `DaemonSet` workloads, the plugin temporarily switches the DaemonSet to
-`OnDelete`, adds a required node-affinity exclusion for the node running the pod
-that owns the PVC, and deletes only that pod. Other DaemonSet pods keep running
-because the strategy change prevents a rolling update. After cutover, the
-original affinity and update strategy are restored and the plugin waits for a
-ready DaemonSet pod on the original node.
-
-For PVCs mounted by multiple running pods, use external application quiescing or
-maintenance-mode logic first. `--allow-multiple-consumers` only disables the
-guard; it does not make concurrent writers safe.
+`OnDelete`, adds required node-affinity exclusions for every node with a pod
+that is consuming the PVC, and deletes those pods. Other DaemonSet pods keep
+running because the strategy change prevents a rolling update. After cutover,
+the original affinity and update strategy are restored and the plugin waits for
+ready DaemonSet pods on the original nodes.
 
 ## Resume Model
 

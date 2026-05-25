@@ -40,7 +40,6 @@ func main() {
 	fs.StringVar(&opts.RsyncArgs, "rsync-args", "-aHAX --numeric-ids --delete --info=progress2", "Arguments passed to rsync.")
 	fs.BoolVar(&opts.Yes, "yes", false, "Apply changes without prompting.")
 	fs.BoolVar(&opts.DryRun, "dry-run", false, "Show actions without changing the cluster.")
-	fs.BoolVar(&opts.AllowMultipleConsumers, "allow-multiple-consumers", false, "Finalize PVCs mounted by multiple pods. Use only when external quiescing is guaranteed.")
 	fs.BoolVar(&opts.SkipInitialSync, "skip-initial-sync", false, "Skip the live initial rsync phase.")
 	fs.BoolVar(&opts.RestoreReclaimPolicy, "restore-reclaim-policy", false, "Restore the destination PV reclaim policy after cutover.")
 
@@ -93,6 +92,5 @@ Selection flags:
 
 Safety flags:
   --dry-run                       Print changes only
-  --allow-multiple-consumers      Disable the default single-writer guard
 `)
 }

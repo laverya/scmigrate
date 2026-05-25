@@ -95,6 +95,88 @@ func TestMigrations(t *testing.T) {
 	}
 }
 
+func TestSharedPVCDeploymentReplicas(t *testing.T) {
+	if os.Getenv("SCMIGRATE_E2E") != "1" {
+		t.Skip("set SCMIGRATE_E2E=1 to run kind-backed e2e tests")
+	}
+	requireEnv(t, "KUBECONFIG")
+	requireEnv(t, "SCMIGRATE_BIN")
+	image := requireEnv(t, "SCMIGRATE_RUNNER_IMAGE")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Minute)
+	defer cancel()
+
+	applyYAML(t, ctx, storageClassesYAML())
+
+	runID := fmt.Sprintf("%d", time.Now().UnixNano())
+	namespace := "scmigrate-e2e-shared-deploy"
+	createNamespace(t, ctx, namespace)
+	t.Cleanup(func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		_ = kubectl(cleanupCtx, "delete", "namespace", namespace, "--ignore-not-found=true")
+	})
+
+	applyYAML(t, ctx, sharedDeploymentYAML(namespace, runID, image))
+	kubectlOK(t, ctx, "rollout", "status", "-n", namespace, "deployment/app", "--timeout=240s")
+	assertReadyReplicas(t, ctx, namespace, "app", 3)
+
+	pod := podName(t, ctx, namespace, "app=scmigrate-e2e-shared-deployment")
+	proof := "shared deployment proof " + runID
+	kubectlOK(t, ctx, "exec", "-n", namespace, pod, "--", "sh", "-c", fmt.Sprintf("printf %%s %q > /data/proof.txt && sync", proof))
+
+	runScmigrate(t, ctx, namespace, "shared-deployment", runID, image)
+
+	kubectlOK(t, ctx, "rollout", "status", "-n", namespace, "deployment/app", "--timeout=240s")
+	assertReadyReplicas(t, ctx, namespace, "app", 3)
+	assertPVC(t, ctx, namespace, "data")
+	restoredPod := podName(t, ctx, namespace, "app=scmigrate-e2e-shared-deployment")
+	assertPodFile(t, ctx, namespace, restoredPod, proof)
+}
+
+func TestSharedPVCMultipleDeployments(t *testing.T) {
+	if os.Getenv("SCMIGRATE_E2E") != "1" {
+		t.Skip("set SCMIGRATE_E2E=1 to run kind-backed e2e tests")
+	}
+	requireEnv(t, "KUBECONFIG")
+	requireEnv(t, "SCMIGRATE_BIN")
+	image := requireEnv(t, "SCMIGRATE_RUNNER_IMAGE")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Minute)
+	defer cancel()
+
+	applyYAML(t, ctx, storageClassesYAML())
+
+	runID := fmt.Sprintf("%d", time.Now().UnixNano())
+	namespace := "scmigrate-e2e-shared-parents"
+	createNamespace(t, ctx, namespace)
+	t.Cleanup(func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		_ = kubectl(cleanupCtx, "delete", "namespace", namespace, "--ignore-not-found=true")
+	})
+
+	applyYAML(t, ctx, sharedMultipleDeploymentsYAML(namespace, runID, image))
+	kubectlOK(t, ctx, "rollout", "status", "-n", namespace, "deployment/api", "--timeout=240s")
+	kubectlOK(t, ctx, "rollout", "status", "-n", namespace, "deployment/worker", "--timeout=240s")
+
+	apiPod := podName(t, ctx, namespace, "app=scmigrate-e2e-shared-api")
+	workerPod := podName(t, ctx, namespace, "app=scmigrate-e2e-shared-worker")
+	proof := "shared parents proof " + runID
+	kubectlOK(t, ctx, "exec", "-n", namespace, apiPod, "--", "sh", "-c", fmt.Sprintf("printf %%s %q > /data/proof.txt && sync", proof))
+	assertPodFile(t, ctx, namespace, workerPod, proof)
+
+	runScmigrate(t, ctx, namespace, "shared-multi-parent", runID, image)
+
+	kubectlOK(t, ctx, "rollout", "status", "-n", namespace, "deployment/api", "--timeout=240s")
+	kubectlOK(t, ctx, "rollout", "status", "-n", namespace, "deployment/worker", "--timeout=240s")
+	assertReadyReplicas(t, ctx, namespace, "api", 2)
+	assertReadyReplicas(t, ctx, namespace, "worker", 1)
+	assertPVC(t, ctx, namespace, "data")
+	assertPodFile(t, ctx, namespace, podName(t, ctx, namespace, "app=scmigrate-e2e-shared-api"), proof)
+	assertPodFile(t, ctx, namespace, podName(t, ctx, namespace, "app=scmigrate-e2e-shared-worker"), proof)
+}
+
 func TestThreeReplicaStatefulSetEmptyPVCs(t *testing.T) {
 	if os.Getenv("SCMIGRATE_E2E") != "1" {
 		t.Skip("set SCMIGRATE_E2E=1 to run kind-backed e2e tests")
@@ -294,6 +376,17 @@ func assertPVC(t *testing.T, ctx context.Context, namespace, name string) {
 	state := strings.TrimSpace(kubectlOK(t, ctx, "get", "pvc", "-n", namespace, name, "-o", "jsonpath={.metadata.annotations.scmigrate\\.laverya\\.github\\.com/state}"))
 	if state != "restored" {
 		t.Fatalf("pvc/%s migration state = %q, want restored", name, state)
+	}
+}
+
+func assertReadyReplicas(t *testing.T, ctx context.Context, namespace, deployment string, want int) {
+	t.Helper()
+	got := strings.TrimSpace(kubectlOK(t, ctx, "get", "deployment", "-n", namespace, deployment, "-o", "jsonpath={.status.readyReplicas}"))
+	if got == "" {
+		got = "0"
+	}
+	if got != fmt.Sprint(want) {
+		t.Fatalf("deployment/%s readyReplicas = %s, want %d", deployment, got, want)
 	}
 }
 
@@ -567,6 +660,131 @@ spec:
       terminationGracePeriodSeconds: 0
       containers:
       - name: app
+        image: %[3]s
+        imagePullPolicy: IfNotPresent
+        command: ["sh", "-c", "trap 'exit 0' TERM INT; sleep 86400 & wait"]
+        volumeMounts:
+        - name: data
+          mountPath: /data
+      volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: data
+`, namespace, runID, image, sourceStorageClass)
+}
+
+func sharedDeploymentYAML(namespace, runID, image string) string {
+	return fmt.Sprintf(`
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: data
+  namespace: %[1]s
+  labels:
+    scmigrate-e2e: shared-deployment
+    scmigrate-e2e-run: "%[2]s"
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: %[4]s
+  resources:
+    requests:
+      storage: 64Mi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app
+  namespace: %[1]s
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: scmigrate-e2e-shared-deployment
+  template:
+    metadata:
+      labels:
+        app: scmigrate-e2e-shared-deployment
+    spec:
+      terminationGracePeriodSeconds: 0
+      containers:
+      - name: app
+        image: %[3]s
+        imagePullPolicy: IfNotPresent
+        command: ["sh", "-c", "trap 'exit 0' TERM INT; sleep 86400 & wait"]
+        volumeMounts:
+        - name: data
+          mountPath: /data
+      volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: data
+`, namespace, runID, image, sourceStorageClass)
+}
+
+func sharedMultipleDeploymentsYAML(namespace, runID, image string) string {
+	return fmt.Sprintf(`
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: data
+  namespace: %[1]s
+  labels:
+    scmigrate-e2e: shared-multi-parent
+    scmigrate-e2e-run: "%[2]s"
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: %[4]s
+  resources:
+    requests:
+      storage: 64Mi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: %[1]s
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: scmigrate-e2e-shared-api
+  template:
+    metadata:
+      labels:
+        app: scmigrate-e2e-shared-api
+    spec:
+      terminationGracePeriodSeconds: 0
+      containers:
+      - name: api
+        image: %[3]s
+        imagePullPolicy: IfNotPresent
+        command: ["sh", "-c", "trap 'exit 0' TERM INT; sleep 86400 & wait"]
+        volumeMounts:
+        - name: data
+          mountPath: /data
+      volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: data
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+  namespace: %[1]s
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: scmigrate-e2e-shared-worker
+  template:
+    metadata:
+      labels:
+        app: scmigrate-e2e-shared-worker
+    spec:
+      terminationGracePeriodSeconds: 0
+      containers:
+      - name: worker
         image: %[3]s
         imagePullPolicy: IfNotPresent
         command: ["sh", "-c", "trap 'exit 0' TERM INT; sleep 86400 & wait"]

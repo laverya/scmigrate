@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -67,13 +68,15 @@ func (r *Runner) Plan(ctx context.Context) error {
 			migration.State,
 			migration.Source.Spec.VolumeName,
 		)
-		consumers, err := r.consumingPods(ctx, migration.Source)
-		if err != nil {
-			return err
-		}
+		consumers := migration.Consumers
 		fmt.Fprintf(r.out, "  consumers: %d\n", len(consumers))
-		for _, pod := range consumers {
-			fmt.Fprintf(r.out, "  - pod/%s phase=%s\n", pod.Name, pod.Status.Phase)
+		for _, consumer := range consumers {
+			fmt.Fprintf(r.out, "  - pod/%s phase=%s owner=%s/%s\n",
+				consumer.Pod.Name,
+				consumer.Pod.Status.Phase,
+				strings.ToLower(consumer.Workload.Kind),
+				consumer.Workload.Name,
+			)
 		}
 		if migration.Destination != nil {
 			fmt.Fprintf(r.out, "  destination: pvc/%s pv=%s\n", migration.Destination.Name, migration.Destination.Spec.VolumeName)
@@ -196,6 +199,11 @@ func (r *Runner) discover(ctx context.Context) ([]*Migration, error) {
 			} else if !apierrors.IsNotFound(err) {
 				return nil, err
 			}
+			consumers, err := r.pvcConsumers(ctx, pvc)
+			if err != nil {
+				return nil, err
+			}
+			migration.Consumers = consumers
 			migrations = append(migrations, migration)
 		}
 	}
@@ -676,15 +684,77 @@ func (r *Runner) consumingPods(ctx context.Context, pvc *corev1.PersistentVolume
 	return consumers, nil
 }
 
+func (r *Runner) pvcConsumers(ctx context.Context, pvc *corev1.PersistentVolumeClaim) ([]PVCConsumer, error) {
+	pods, err := r.consumingPods(ctx, pvc)
+	if err != nil {
+		return nil, err
+	}
+	consumers := make([]PVCConsumer, 0, len(pods))
+	for i := range pods {
+		ref, err := r.workloadRefForPod(ctx, &pods[i])
+		if err != nil {
+			return nil, err
+		}
+		consumers = append(consumers, PVCConsumer{Pod: pods[i], Workload: ref})
+	}
+	sort.SliceStable(consumers, func(i, j int) bool {
+		left := consumers[i]
+		right := consumers[j]
+		if left.Workload.Namespace != right.Workload.Namespace {
+			return left.Workload.Namespace < right.Workload.Namespace
+		}
+		if left.Workload.Kind != right.Workload.Kind {
+			return left.Workload.Kind < right.Workload.Kind
+		}
+		if left.Workload.Name != right.Workload.Name {
+			return left.Workload.Name < right.Workload.Name
+		}
+		return left.Pod.Name < right.Pod.Name
+	})
+	return consumers, nil
+}
+
+func (r *Runner) workloadRefForPod(ctx context.Context, pod *corev1.Pod) (WorkloadRef, error) {
+	owner := controllerOwner(pod.OwnerReferences)
+	if owner == nil {
+		return WorkloadRef{Kind: "Pod", Namespace: pod.Namespace, Name: pod.Name}, nil
+	}
+
+	switch owner.Kind {
+	case "ReplicaSet":
+		rs, err := r.client.AppsV1().ReplicaSets(pod.Namespace).Get(ctx, owner.Name, metav1.GetOptions{})
+		if err != nil {
+			return WorkloadRef{}, err
+		}
+		if deployOwner := controllerOwner(rs.OwnerReferences); deployOwner != nil && deployOwner.Kind == "Deployment" {
+			return WorkloadRef{Kind: "Deployment", Namespace: pod.Namespace, Name: deployOwner.Name}, nil
+		}
+		return WorkloadRef{Kind: "ReplicaSet", Namespace: pod.Namespace, Name: owner.Name}, nil
+	case "StatefulSet", "DaemonSet":
+		return WorkloadRef{Kind: owner.Kind, Namespace: pod.Namespace, Name: owner.Name}, nil
+	default:
+		return WorkloadRef{}, fmt.Errorf("unsupported pod controller %s/%s for pod/%s", owner.Kind, owner.Name, pod.Name)
+	}
+}
+
 func (r *Runner) syncNodeName(ctx context.Context, pvc *corev1.PersistentVolumeClaim) (string, error) {
 	consumers, err := r.consumingPods(ctx, pvc)
 	if err != nil {
 		return "", err
 	}
-	if len(consumers) != 1 {
+	if len(consumers) == 0 {
 		return "", nil
 	}
-	return consumers[0].Spec.NodeName, nil
+	nodeName := consumers[0].Spec.NodeName
+	if nodeName == "" {
+		return "", nil
+	}
+	for _, consumer := range consumers[1:] {
+		if consumer.Spec.NodeName != nodeName {
+			return "", nil
+		}
+	}
+	return nodeName, nil
 }
 
 func affinityForNode(nodeName string) *corev1.Affinity {
