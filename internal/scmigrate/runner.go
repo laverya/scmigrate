@@ -113,6 +113,9 @@ func (r *Runner) Run(ctx context.Context) error {
 }
 
 func (r *Runner) migrate(ctx context.Context, migration *Migration) error {
+	if r.opts.DryRun {
+		return r.dryRunMigrate(ctx, migration)
+	}
 	source := migration.Source
 	source, state, err := r.currentPVCState(ctx, source.Namespace, source.Name)
 	if apierrors.IsNotFound(err) {
@@ -186,6 +189,116 @@ func (r *Runner) migrate(ctx context.Context, migration *Migration) error {
 	return nil
 }
 
+func (r *Runner) dryRunMigrate(ctx context.Context, migration *Migration) error {
+	source := migration.Source.DeepCopy()
+	current, state, err := r.currentPVCState(ctx, source.Namespace, source.Name)
+	if err == nil {
+		source = current.DeepCopy()
+	} else if apierrors.IsNotFound(err) {
+		state = migration.State
+		if state == "" {
+			state = StateFinalSynced
+		}
+	} else {
+		return err
+	}
+	if err := r.validateTargetStorageClass(source.Namespace+"/"+source.Name, source.Annotations); err != nil {
+		return err
+	}
+	if source.Annotations == nil {
+		source.Annotations = map[string]string{}
+	}
+	if source.Annotations[AnnDestinationPVC] == "" {
+		source.Annotations[AnnDestinationPVC] = tempPVCName(source)
+	}
+	if stateBefore(state, StatePrepared) {
+		if err := validateSourcePVC(source); err != nil {
+			return err
+		}
+		fmt.Fprintf(r.out, "dry-run: patch pvc/%s annotations %v\n", source.Name, []string{AnnDestinationPVC, AnnOriginalPVC, AnnSourcePV, AnnState, AnnTargetStorageClass})
+		fmt.Fprintf(r.out, "dry-run: create destination pvc/%s in %s\n", source.Annotations[AnnDestinationPVC], source.Namespace)
+		state = StatePrepared
+	}
+	if !r.opts.SkipInitialSync && stateBefore(state, StateInitialSynced) {
+		fmt.Fprintf(r.out, "dry-run: run initial sync pod/%s from pvc/%s to pvc/%s\n", syncPodName(source, "initial"), source.Name, source.Annotations[AnnDestinationPVC])
+		state = StateInitialSynced
+	}
+	if stateBefore(state, StateQuiesced) {
+		records, err := r.dryRunQuiesce(ctx, source)
+		if err != nil {
+			return err
+		}
+		raw, err := json.Marshal(records)
+		if err != nil {
+			return err
+		}
+		source.Annotations[AnnQuiesce] = string(raw)
+		state = StateQuiesced
+	}
+	if stateBefore(state, StateFinalSynced) {
+		fmt.Fprintf(r.out, "dry-run: run final sync pod/%s from pvc/%s to pvc/%s\n", syncPodName(source, "final"), source.Name, source.Annotations[AnnDestinationPVC])
+		state = StateFinalSynced
+	}
+	if stateBefore(state, StateCutover) {
+		if err := r.dryRunCutover(ctx, source); err != nil {
+			return err
+		}
+		state = StateCutover
+	}
+	if stateBefore(state, StateRestored) {
+		fmt.Fprintf(r.out, "dry-run: restore workload(s) and mark pvc/%s state=%s\n", source.Name, StateRestored)
+	}
+	return nil
+}
+
+func (r *Runner) dryRunQuiesce(ctx context.Context, pvc *corev1.PersistentVolumeClaim) ([]QuiesceRecord, error) {
+	var records []QuiesceRecord
+	if raw := pvc.Annotations[AnnQuiesce]; raw != "" {
+		parsed, err := quiesceRecordsFromAnnotation(raw)
+		if err != nil {
+			return nil, err
+		}
+		records = parsed
+	} else {
+		consumers, err := r.pvcConsumers(ctx, pvc)
+		if err != nil {
+			return nil, err
+		}
+		parsed, err := r.quiesceConsumerGroups(ctx, pvc, consumers)
+		if err != nil {
+			return nil, err
+		}
+		records = parsed
+	}
+	fmt.Fprintf(r.out, "dry-run: store %d quiesce record(s) on pvc/%s and destination pvc/%s\n", len(records), pvc.Name, pvc.Annotations[AnnDestinationPVC])
+	return records, r.applyQuiesceRecords(ctx, records)
+}
+
+func (r *Runner) dryRunCutover(ctx context.Context, source *corev1.PersistentVolumeClaim) error {
+	destName := source.Annotations[AnnDestinationPVC]
+	destPV := source.Annotations[AnnDestinationPV]
+	if dest, err := r.destinationPVC(ctx, source); err == nil {
+		destName = dest.Name
+		destPV = dest.Spec.VolumeName
+		if err := r.validateTargetStorageClass("pvc/"+dest.Namespace+"/"+dest.Name, dest.Annotations); err != nil {
+			return err
+		}
+	} else if !apierrors.IsNotFound(err) {
+		return err
+	}
+	if destPV == "" {
+		destPV = "<destination-pv-after-binding>"
+	}
+	fmt.Fprintf(r.out, "dry-run: wait for destination pvc/%s to bind\n", destName)
+	if source.Spec.VolumeName != "" {
+		fmt.Fprintf(r.out, "dry-run: set pv/%s reclaimPolicy=Retain\n", source.Spec.VolumeName)
+	}
+	fmt.Fprintf(r.out, "dry-run: set pv/%s reclaimPolicy=Retain\n", destPV)
+	fmt.Fprintf(r.out, "dry-run: persist cutover record on pv/%s\n", destPV)
+	fmt.Fprintf(r.out, "dry-run: delete pvc/%s and pvc/%s, clear pv/%s claimRef, create final pvc/%s bound to pv/%s\n", source.Name, destName, destPV, source.Name, destPV)
+	return nil
+}
+
 func (r *Runner) discover(ctx context.Context) ([]*Migration, error) {
 	namespaces := []string{r.opts.Namespace}
 	if r.opts.AllNamespaces {
@@ -210,6 +323,12 @@ func (r *Runner) discover(ctx context.Context) ([]*Migration, error) {
 			if r.skipPVC(pvc) {
 				continue
 			}
+			if err := validateSourcePVC(pvc); err != nil {
+				return nil, fmt.Errorf("%s/%s: %w", pvc.Namespace, pvc.Name, err)
+			}
+			if err := r.validateTargetStorageClass("pvc/"+pvc.Namespace+"/"+pvc.Name, pvc.Annotations); err != nil {
+				return nil, err
+			}
 			pv, err := r.boundPV(ctx, pvc)
 			if err != nil {
 				return nil, err
@@ -219,6 +338,9 @@ func (r *Runner) discover(ctx context.Context) ([]*Migration, error) {
 				migration.State = "new"
 			}
 			if dest, err := r.destinationPVC(ctx, pvc); err == nil {
+				if err := r.validateTargetStorageClass("pvc/"+dest.Namespace+"/"+dest.Name, dest.Annotations); err != nil {
+					return nil, err
+				}
 				migration.Destination = dest
 				if dest.Spec.VolumeName != "" {
 					if destPV, pvErr := r.client.CoreV1().PersistentVolumes().Get(ctx, dest.Spec.VolumeName, metav1.GetOptions{}); pvErr == nil {
@@ -240,6 +362,11 @@ func (r *Runner) discover(ctx context.Context) ([]*Migration, error) {
 			return nil, err
 		}
 		migrations = append(migrations, resumable...)
+		pvResumable, err := r.discoverResumableCutoverPVs(ctx, namespace)
+		if err != nil {
+			return nil, err
+		}
+		migrations = append(migrations, pvResumable...)
 	}
 	sortMigrations(migrations)
 	return migrations, nil
@@ -259,6 +386,9 @@ func (r *Runner) discoverResumableDestinations(ctx context.Context, namespace st
 		if sourceName == "" {
 			continue
 		}
+		if err := r.validateTargetStorageClass("pvc/"+dest.Namespace+"/"+dest.Name, dest.Annotations); err != nil {
+			return nil, err
+		}
 		if _, err := r.client.CoreV1().PersistentVolumeClaims(namespace).Get(ctx, sourceName, metav1.GetOptions{}); err == nil {
 			continue
 		} else if !apierrors.IsNotFound(err) {
@@ -274,6 +404,9 @@ func (r *Runner) discoverResumableDestinations(ctx context.Context, namespace st
 		}
 		if !matches {
 			continue
+		}
+		if err := validateStoredPVC(stored); err != nil {
+			return nil, fmt.Errorf("%s/%s: %w", stored.Namespace, stored.Name, err)
 		}
 		state := dest.Annotations[AnnState]
 		if state == "" {
@@ -298,6 +431,73 @@ func (r *Runner) discoverResumableDestinations(ctx context.Context, namespace st
 			}
 		}
 		migrations = append(migrations, migration)
+	}
+	return migrations, nil
+}
+
+func (r *Runner) discoverResumableCutoverPVs(ctx context.Context, namespace string) ([]*Migration, error) {
+	pvs, err := r.client.CoreV1().PersistentVolumes().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+	var migrations []*Migration
+	for i := range pvs.Items {
+		pv := pvs.Items[i].DeepCopy()
+		annotations := pv.Annotations
+		if annotations[AnnSourceNamespace] != namespace || annotations[AnnOriginalPVC] == "" {
+			continue
+		}
+		sourceName := annotations[AnnSourcePVC]
+		if sourceName == "" {
+			continue
+		}
+		if err := r.validateTargetStorageClass("pv/"+pv.Name, annotations); err != nil {
+			return nil, err
+		}
+		if _, err := r.client.CoreV1().PersistentVolumeClaims(namespace).Get(ctx, sourceName, metav1.GetOptions{}); err == nil {
+			continue
+		} else if !apierrors.IsNotFound(err) {
+			return nil, err
+		}
+		if destName := annotations[AnnDestinationPVC]; destName != "" {
+			if _, err := r.client.CoreV1().PersistentVolumeClaims(namespace).Get(ctx, destName, metav1.GetOptions{}); err == nil {
+				continue
+			} else if !apierrors.IsNotFound(err) {
+				return nil, err
+			}
+		}
+		stored, err := storedPVC(annotations[AnnOriginalPVC])
+		if err != nil {
+			return nil, err
+		}
+		matches, err := r.storedPVCMatchesOptions(stored)
+		if err != nil {
+			return nil, err
+		}
+		if !matches {
+			continue
+		}
+		if err := validateStoredPVC(stored); err != nil {
+			return nil, fmt.Errorf("%s/%s: %w", stored.Namespace, stored.Name, err)
+		}
+		source := &corev1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      sourceName,
+				Namespace: namespace,
+				UID:       types.UID(annotations[AnnSourceUID]),
+				Labels:    cloneMap(stored.Labels),
+				Annotations: map[string]string{
+					AnnDestinationPVC:     annotations[AnnDestinationPVC],
+					AnnDestinationPV:      pv.Name,
+					AnnOriginalPVC:        annotations[AnnOriginalPVC],
+					AnnQuiesce:            annotations[AnnQuiesce],
+					AnnState:              StateFinalSynced,
+					AnnTargetStorageClass: annotations[AnnTargetStorageClass],
+				},
+			},
+			Spec: corev1.PersistentVolumeClaimSpec{VolumeName: annotations[AnnSourcePV]},
+		}
+		migrations = append(migrations, &Migration{Source: source, DestPV: pv, State: StateFinalSynced})
 	}
 	return migrations, nil
 }
@@ -356,6 +556,38 @@ func (r *Runner) skipPVC(pvc *corev1.PersistentVolumeClaim) bool {
 	return false
 }
 
+func validateSourcePVC(pvc *corev1.PersistentVolumeClaim) error {
+	if pvc.Spec.VolumeMode != nil && *pvc.Spec.VolumeMode == corev1.PersistentVolumeBlock {
+		return errors.New("block volumeMode is not supported; scmigrate requires filesystem PVCs")
+	}
+	for _, mode := range pvc.Spec.AccessModes {
+		if mode == corev1.ReadWriteOncePod {
+			return errors.New("ReadWriteOncePod access mode is not supported because sync pods need to mount the PVC during migration")
+		}
+	}
+	return nil
+}
+
+func validateStoredPVC(stored *StoredPVC) error {
+	if stored.VolumeMode != nil && *stored.VolumeMode == corev1.PersistentVolumeBlock {
+		return errors.New("block volumeMode is not supported; scmigrate requires filesystem PVCs")
+	}
+	for _, mode := range stored.AccessModes {
+		if mode == corev1.ReadWriteOncePod {
+			return errors.New("ReadWriteOncePod access mode is not supported because sync pods need to mount the PVC during migration")
+		}
+	}
+	return nil
+}
+
+func (r *Runner) validateTargetStorageClass(object string, annotations map[string]string) error {
+	recorded := annotations[AnnTargetStorageClass]
+	if recorded == "" || recorded == r.opts.TargetStorageClass {
+		return nil
+	}
+	return fmt.Errorf("%s was prepared for target storageClass %q; rerun with --target-storage-class %s instead of %q", object, recorded, recorded, r.opts.TargetStorageClass)
+}
+
 func (r *Runner) currentPVCState(ctx context.Context, namespace, name string) (*corev1.PersistentVolumeClaim, string, error) {
 	pvc, err := r.client.CoreV1().PersistentVolumeClaims(namespace).Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
@@ -369,6 +601,9 @@ func (r *Runner) currentPVCState(ctx context.Context, namespace, name string) (*
 }
 
 func (r *Runner) prepare(ctx context.Context, source *corev1.PersistentVolumeClaim) error {
+	if err := validateSourcePVC(source); err != nil {
+		return err
+	}
 	tempName := tempPVCName(source)
 	snapshot, err := pvcSnapshot(source)
 	if err != nil {
@@ -581,6 +816,9 @@ func (r *Runner) cutover(ctx context.Context, source *corev1.PersistentVolumeCla
 	}); err != nil {
 		return err
 	}
+	if err := r.persistCutoverRecord(ctx, source, dest, destPV); err != nil {
+		return err
+	}
 
 	if r.opts.DryRun {
 		fmt.Fprintf(r.out, "dry-run: delete pvc/%s and pvc/%s, clear pv/%s claimRef, create final pvc/%s bound to pv/%s\n", source.Name, dest.Name, dest.Spec.VolumeName, source.Name, dest.Spec.VolumeName)
@@ -644,14 +882,33 @@ func (r *Runner) resumeCutoverWithoutSource(ctx context.Context, namespace, name
 		if final, err := r.client.CoreV1().PersistentVolumeClaims(namespace).Get(ctx, name, metav1.GetOptions{}); err == nil && final.Annotations[AnnState] == StateCutover {
 			return nil
 		}
-		return fmt.Errorf("source PVC is gone and no resumable destination PVC for %s/%s was found", namespace, name)
+		return r.resumeCutoverFromPV(ctx, namespace, name)
 	}
 	dest, err := r.client.CoreV1().PersistentVolumeClaims(namespace).Get(ctx, destName, metav1.GetOptions{})
 	if err != nil {
 		return err
 	}
+	if err := r.validateTargetStorageClass("pvc/"+dest.Namespace+"/"+dest.Name, dest.Annotations); err != nil {
+		return err
+	}
 	if dest.Spec.VolumeName == "" {
 		return fmt.Errorf("destination pvc/%s is not bound", dest.Name)
+	}
+	destPV, err := r.client.CoreV1().PersistentVolumes().Get(ctx, dest.Spec.VolumeName, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+	syntheticSource := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        name,
+			Namespace:   namespace,
+			UID:         types.UID(dest.Annotations[AnnSourceUID]),
+			Annotations: map[string]string{AnnQuiesce: dest.Annotations[AnnQuiesce]},
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{VolumeName: dest.Annotations[AnnSourcePV]},
+	}
+	if err := r.persistCutoverRecord(ctx, syntheticSource, dest, destPV); err != nil {
+		return err
 	}
 	if err := r.client.CoreV1().PersistentVolumeClaims(namespace).Delete(ctx, dest.Name, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
 		return err
@@ -680,6 +937,78 @@ func (r *Runner) resumeCutoverWithoutSource(ctx context.Context, namespace, name
 		return err
 	}
 	return r.waitPVCBound(ctx, namespace, finalPVC.Name)
+}
+
+func (r *Runner) persistCutoverRecord(ctx context.Context, source, dest *corev1.PersistentVolumeClaim, destPV *corev1.PersistentVolume) error {
+	annotations := map[string]string{
+		AnnState:              StateFinalSynced,
+		AnnSourcePVC:          source.Name,
+		AnnSourceNamespace:    source.Namespace,
+		AnnSourceUID:          string(source.UID),
+		AnnSourcePV:           source.Spec.VolumeName,
+		AnnDestinationPVC:     dest.Name,
+		AnnDestinationPV:      destPV.Name,
+		AnnTargetStorageClass: r.opts.TargetStorageClass,
+		AnnOriginalPVC:        dest.Annotations[AnnOriginalPVC],
+	}
+	if quiesce := source.Annotations[AnnQuiesce]; quiesce != "" {
+		annotations[AnnQuiesce] = quiesce
+	} else if quiesce := dest.Annotations[AnnQuiesce]; quiesce != "" {
+		annotations[AnnQuiesce] = quiesce
+	}
+	payload := map[string]any{"metadata": map[string]any{"annotations": annotations}}
+	data, _ := json.Marshal(payload)
+	if r.opts.DryRun {
+		fmt.Fprintf(r.out, "dry-run: persist cutover record on pv/%s\n", destPV.Name)
+		return nil
+	}
+	_, err := r.client.CoreV1().PersistentVolumes().Patch(ctx, destPV.Name, types.MergePatchType, data, metav1.PatchOptions{})
+	return err
+}
+
+func (r *Runner) resumeCutoverFromPV(ctx context.Context, namespace, name string) error {
+	pvs, err := r.client.CoreV1().PersistentVolumes().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return err
+	}
+	for i := range pvs.Items {
+		pv := pvs.Items[i].DeepCopy()
+		annotations := pv.Annotations
+		if annotations[AnnSourceNamespace] != namespace || annotations[AnnSourcePVC] != name || annotations[AnnOriginalPVC] == "" {
+			continue
+		}
+		if err := r.validateTargetStorageClass("pv/"+pv.Name, annotations); err != nil {
+			return err
+		}
+		if err := r.clearPVClaimRef(ctx, pv.Name); err != nil {
+			return err
+		}
+		stored, err := storedPVC(annotations[AnnOriginalPVC])
+		if err != nil {
+			return err
+		}
+		finalPVC, err := finalPVCFromStored(stored, r.opts.TargetStorageClass, pv.Name)
+		if err != nil {
+			return err
+		}
+		if annotations[AnnQuiesce] != "" {
+			finalPVC.Annotations[AnnQuiesce] = annotations[AnnQuiesce]
+		}
+		finalPVC.Annotations[AnnDestinationPVC] = annotations[AnnDestinationPVC]
+		finalPVC.Annotations[AnnOriginalPVC] = annotations[AnnOriginalPVC]
+		_, err = r.client.CoreV1().PersistentVolumeClaims(namespace).Create(ctx, finalPVC, metav1.CreateOptions{})
+		if err != nil && !apierrors.IsAlreadyExists(err) {
+			return err
+		}
+		if err := r.waitPVCBound(ctx, namespace, finalPVC.Name); err != nil {
+			return err
+		}
+		if r.opts.RestoreReclaimPolicy {
+			return r.restoreDestinationReclaimPolicy(ctx, pv.Name)
+		}
+		return nil
+	}
+	return fmt.Errorf("source PVC is gone and no resumable destination PVC or PV cutover record for %s/%s was found", namespace, name)
 }
 
 func (r *Runner) boundPV(ctx context.Context, pvc *corev1.PersistentVolumeClaim) (*corev1.PersistentVolume, error) {
@@ -729,7 +1058,14 @@ func (r *Runner) clearPVClaimRef(ctx context.Context, pvName string) error {
 		fmt.Fprintf(r.out, "dry-run: clear pv/%s claimRef\n", pvName)
 		return nil
 	}
-	_, err := r.client.CoreV1().PersistentVolumes().Patch(ctx, pvName, types.JSONPatchType, patch, metav1.PatchOptions{})
+	pv, err := r.client.CoreV1().PersistentVolumes().Get(ctx, pvName, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+	if pv.Spec.ClaimRef == nil {
+		return nil
+	}
+	_, err = r.client.CoreV1().PersistentVolumes().Patch(ctx, pvName, types.JSONPatchType, patch, metav1.PatchOptions{})
 	if apierrors.IsInvalid(err) || apierrors.IsNotFound(err) {
 		return err
 	}

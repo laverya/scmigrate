@@ -412,7 +412,8 @@ func TestQuiesceStatefulSetConsumersScalesSharedPVCToZero(t *testing.T) {
 	client := fake.NewSimpleClientset(sts)
 	runner := &Runner{client: client, out: io.Discard}
 
-	record, err := runner.quiesceStatefulSetConsumers(ctx, WorkloadRef{Kind: "StatefulSet", Namespace: "default", Name: "db"}, pods)
+	pvc := testPVC("default", "data")
+	record, err := runner.quiesceStatefulSetConsumers(ctx, pvc, WorkloadRef{Kind: "StatefulSet", Namespace: "default", Name: "db"}, pods)
 	if err != nil {
 		t.Fatalf("quiesceStatefulSetConsumers returned error: %v", err)
 	}
@@ -442,11 +443,12 @@ func TestQuiesceStatefulSetHighestOrdinalOrphansAndRestoreRecreates(t *testing.T
 	client := fake.NewSimpleClientset(sts, pod)
 	runner := &Runner{client: client, out: io.Discard}
 
-	record, err := runner.quiesceStatefulSet(ctx, pod, sts)
+	pvc := boundPVC("default", "data", "source-pv", "old-sc")
+	record, err := runner.quiesceStatefulSet(ctx, pvc, pod, sts)
 	if err != nil {
 		t.Fatalf("quiesceStatefulSet returned error: %v", err)
 	}
-	if record.Kind != "StatefulSet" || record.OriginalReplicas != 3 || record.StatefulSet == nil {
+	if record.Kind != "StatefulSet" || record.OriginalReplicas != 3 || record.StatefulSetConfigMap == "" {
 		t.Fatalf("unexpected statefulset record: %#v", record)
 	}
 	if err := runner.applyQuiesceRecord(ctx, record); err != nil {
@@ -515,9 +517,12 @@ func TestQuiesceStoresStatefulSetRecordBeforeDeletingStatefulSet(t *testing.T) {
 		if err != nil {
 			t.Fatalf("decode quiesce records on pvc/%s: %v", name, err)
 		}
-		if len(records) != 1 || records[0].StatefulSet == nil {
-			t.Fatalf("pvc/%s does not contain persisted StatefulSet record: %#v", name, records)
+		if len(records) != 1 || records[0].StatefulSetConfigMap == "" || records[0].StatefulSet != nil {
+			t.Fatalf("pvc/%s does not contain compact StatefulSet record reference: %#v", name, records)
 		}
+	}
+	if _, err := client.CoreV1().ConfigMaps("default").Get(ctx, statefulSetRecordName(source, sts), metav1.GetOptions{}); err != nil {
+		t.Fatalf("get statefulset restore configmap: %v", err)
 	}
 }
 
@@ -564,17 +569,18 @@ func TestQuiesceReusesStoredRecordWhenConsumersAlreadyGone(t *testing.T) {
 	}
 }
 
-func TestQuiesceStatefulSetRejectsNonHighestOrdinal(t *testing.T) {
+func TestQuiesceStatefulSetRejectsOrdinalOutsideReplicaRange(t *testing.T) {
 	sts := &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{Name: "db", Namespace: "default"},
 		Spec:       appsv1.StatefulSetSpec{Replicas: int32Ptr(3)},
 	}
-	pod := testPod("default", "db-0", "data", "node-a", controllerRef("StatefulSet", "db"))
+	pvc := boundPVC("default", "data", "source-pv", "old-sc")
+	pod := testPod("default", "db-3", "data", "node-a", controllerRef("StatefulSet", "db"))
 	runner := &Runner{client: fake.NewSimpleClientset(), out: io.Discard}
 
-	_, err := runner.quiesceStatefulSet(testContext(t), pod, sts)
-	if err == nil || !strings.Contains(err.Error(), "highest ordinal") {
-		t.Fatalf("quiesceStatefulSet error = %v, want highest ordinal error", err)
+	_, err := runner.quiesceStatefulSet(testContext(t), pvc, pod, sts)
+	if err == nil || !strings.Contains(err.Error(), "outside current replica count") {
+		t.Fatalf("quiesceStatefulSet error = %v, want outside replica count error", err)
 	}
 }
 

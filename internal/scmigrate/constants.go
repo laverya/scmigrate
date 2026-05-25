@@ -20,6 +20,8 @@ const (
 	LabelRole      = AnnotationPrefix + "role"
 	LabelSourceUID = AnnotationPrefix + "source-uid"
 
+	ConfigMapKeyStatefulSet = "statefulset.json"
+
 	StatePrepared      = "prepared"
 	StateInitialSynced = "initial-synced"
 	StateQuiesced      = "quiesced"

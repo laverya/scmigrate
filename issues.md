@@ -8,6 +8,8 @@ and what needs stronger documentation.
 
 ### P0: Cutover has an unrecoverable interruption window
 
+Status: Resolved.
+
 `internal/scmigrate/runner.go` deletes the source PVC and the temporary
 destination PVC before creating the final PVC:
 
@@ -26,7 +28,13 @@ Suggested direction: keep a durable cutover record somewhere that survives temp
 PVC deletion, or create a replacement final PVC using a sequence that does not
 destroy the last copy of the stored spec before the final object exists.
 
+Resolution: the destination PV is annotated with the original PVC snapshot and
+quiesce record before either PVC is deleted, and resume can recreate the final
+PVC from that PV cutover record if both PVC objects are gone.
+
 ### P1: Multi-replica StatefulSet migration likely fails after the first ordinal
+
+Status: Resolved.
 
 The code sorts PVCs by descending ordinal and requires each single-pod
 StatefulSet PVC to belong to the current highest ordinal. After migrating
@@ -41,7 +49,13 @@ Suggested direction: keep the StatefulSet scaled/orphaned state coordinated
 across all selected PVCs for that StatefulSet, or adjust the ordinal logic so
 already-migrated higher ordinals do not block lower ordinals.
 
+Resolution: the single-pod StatefulSet path no longer requires the consumer to
+be the highest ordinal, and the restore object is persisted outside the PVC
+annotation so each ordinal can be migrated independently.
+
 ### P1: The shipped RBAC cannot run the StatefulSet path
+
+Status: Resolved.
 
 `deploy/rbac.yaml` grants `get`, `list`, and `patch` on StatefulSets, but the
 implementation deletes and recreates StatefulSets during the orphan-and-restore
@@ -51,7 +65,13 @@ migrations.
 Suggested direction: add the required `delete` and `create` verbs for
 StatefulSets, or change the implementation to avoid those verbs.
 
+Resolution: RBAC now grants the StatefulSet create/delete verbs needed by the
+orphan-and-restore path, and includes ConfigMap access for StatefulSet restore
+records.
+
 ### P1: `--dry-run` is not a usable fresh-run preview
+
+Status: Resolved.
 
 On a fresh PVC, `prepare` prints the destination PVC creation instead of
 creating it. The migration then reloads unchanged cluster state and the sync
@@ -62,7 +82,12 @@ Suggested direction: make dry-run operate on an in-memory projected state, or
 make `plan` the explicit full preview and keep `--dry-run` documented as a
 single-step mutation guard.
 
+Resolution: dry-run migration now projects the migration phases without
+requiring the destination PVC to exist in the cluster.
+
 ### P1: The Docker build stage is pinned below the module Go version
+
+Status: Resolved.
 
 `go.mod` requires Go 1.26, while `Dockerfile` uses `golang:1.22`. Container
 builds will fail or rely on toolchain auto-download behavior rather than the
@@ -71,7 +96,11 @@ declared build image.
 Suggested direction: update the Docker build image to a Go version compatible
 with `go.mod`, or lower `go.mod` if the code and dependencies support it.
 
+Resolution: the Docker build image now matches the Go 1.26 module version.
+
 ### P2: Some PVC types are copied but cannot actually be synced
+
+Status: Resolved.
 
 The migration preserves `VolumeMode`, but sync pods always use filesystem
 `VolumeMounts`. Block-mode PVCs should be rejected before migration because
@@ -82,7 +111,12 @@ source PVC is already mounted by the workload pod.
 Suggested direction: add preflight validation for unsupported volume modes and
 access modes, with clear errors.
 
+Resolution: block-mode PVCs and `ReadWriteOncePod` PVCs are rejected during
+discovery and preparation with explicit errors.
+
 ### P2: Resume can drift if rerun with a different target storage class
+
+Status: Resolved.
 
 Resumable destination discovery checks selector, source storage class, and
 annotation filters, but it does not check the stored target storage class. A
@@ -93,7 +127,12 @@ was provisioned for the old target class.
 Suggested direction: compare `AnnTargetStorageClass` on resumable objects with
 the current option and fail loudly on mismatch.
 
+Resolution: resumable PVC and PV state is validated against the requested target
+storage class and fails fast on mismatches.
+
 ### P2: Full StatefulSet specs stored in annotations can exceed Kubernetes limits
+
+Status: Resolved.
 
 The quiesce record can embed an entire StatefulSet object and then store that
 JSON in PVC annotations. Real StatefulSets with large environment variables,
@@ -104,7 +143,12 @@ Suggested direction: store only the fields required to restore the StatefulSet,
 or persist the restore record in a dedicated object with better size
 characteristics.
 
+Resolution: StatefulSet restore specs are stored in migration-managed
+ConfigMaps, and the quiesce annotation stores only the ConfigMap reference.
+
 ## Not Obvious
+
+Status: Resolved in README documentation.
 
 - Supported pod owners are limited to standalone Pods, Deployments,
   ReplicaSets, StatefulSets, and DaemonSets. Jobs, CronJobs, Argo Rollouts,
@@ -124,6 +168,8 @@ characteristics.
 
 ## Documentation Gaps
 
+Status: Resolved in README documentation.
+
 - Document the exact controller support matrix and what happens for unsupported
   owners.
 - Document required RBAC by workload type, especially StatefulSet delete/create
@@ -138,14 +184,15 @@ characteristics.
 - Document cleanup responsibilities for retained old PVs and temporary
   migration artifacts.
 
-## Verification Performed During Review
+## Verification Performed After Fixes
 
-The local checks passed:
+The local checks passed after the fixes:
 
 ```sh
 GOCACHE=/tmp/scmigrate-go-cache go test ./...
-go vet ./...
+GOCACHE=/tmp/scmigrate-go-cache go vet ./...
 ```
 
-The kind-backed e2e suite was not run during review because it requires
-`SCMIGRATE_E2E=1`, Docker, kind, and kubectl.
+The kind-backed e2e tests are still gated by `SCMIGRATE_E2E=1`; the package was
+included in `go test ./...`, but those tests remain skipped unless the
+environment opts in with Docker, kind, and kubectl.

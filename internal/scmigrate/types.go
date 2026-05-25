@@ -54,15 +54,16 @@ type StoredPVC struct {
 }
 
 type QuiesceRecord struct {
-	Kind              string                         `json:"kind"`
-	Name              string                         `json:"name"`
-	Namespace         string                         `json:"namespace"`
-	OriginalReplicas  int32                          `json:"originalReplicas"`
-	PodName           string                         `json:"podName"`
-	PodNames          []string                       `json:"podNames,omitempty"`
-	NodeName          string                         `json:"nodeName,omitempty"`
-	NodeNames         []string                       `json:"nodeNames,omitempty"`
-	StatefulSet       *appsv1.StatefulSet            `json:"statefulSet,omitempty"`
-	DaemonSetStrategy appsv1.DaemonSetUpdateStrategy `json:"daemonSetStrategy,omitempty"`
-	DaemonSetAffinity *corev1.Affinity               `json:"daemonSetAffinity,omitempty"`
+	Kind                 string                         `json:"kind"`
+	Name                 string                         `json:"name"`
+	Namespace            string                         `json:"namespace"`
+	OriginalReplicas     int32                          `json:"originalReplicas"`
+	PodName              string                         `json:"podName"`
+	PodNames             []string                       `json:"podNames,omitempty"`
+	NodeName             string                         `json:"nodeName,omitempty"`
+	NodeNames            []string                       `json:"nodeNames,omitempty"`
+	StatefulSetConfigMap string                         `json:"statefulSetConfigMap,omitempty"`
+	StatefulSet          *appsv1.StatefulSet            `json:"statefulSet,omitempty"`
+	DaemonSetStrategy    appsv1.DaemonSetUpdateStrategy `json:"daemonSetStrategy,omitempty"`
+	DaemonSetAffinity    *corev1.Affinity               `json:"daemonSetAffinity,omitempty"`
 }

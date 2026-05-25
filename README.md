@@ -26,7 +26,9 @@ docker push ghcr.io/laverya/scmigrate-rsync:latest
 ```
 
 Apply RBAC for an in-cluster runner, or grant equivalent rights to the user that
-runs the plugin:
+runs the plugin. StatefulSet migrations require permission to delete and
+recreate StatefulSets; `scmigrate` also creates a migration-managed ConfigMap
+restore record when it uses the StatefulSet orphaning path.
 
 ```sh
 kubectl create namespace scmigrate-system
@@ -107,11 +109,11 @@ multiple parent resources.
 
 For `StatefulSet` workloads using ordinary `volumeClaimTemplates`, each PVC is
 usually consumed by one pod. The plugin sorts those PVCs by trailing ordinal in
-descending order, temporarily orphans the StatefulSet, deletes the consumer pod,
-and recreates the StatefulSet after cutover. This keeps one StatefulSet pod down
-at a time. If a StatefulSet shares one PVC across multiple pods, the plugin
-scales the StatefulSet to zero and restores the original replica count after
-cutover.
+descending order, stores the StatefulSet restore spec in a migration-managed
+ConfigMap, temporarily orphans the StatefulSet, deletes the consumer pod, and
+recreates the StatefulSet after cutover. This keeps one StatefulSet pod down at
+a time. If a StatefulSet shares one PVC across multiple pods, the plugin scales
+the StatefulSet to zero and restores the original replica count after cutover.
 
 For `DaemonSet` workloads, the plugin temporarily switches the DaemonSet to
 `OnDelete`, adds required node-affinity exclusions for every node with a pod
@@ -132,24 +134,81 @@ The temporary destination PVC stores the original PVC metadata and workload
 quiesce record. That means a run can resume even after the original PVC has been
 deleted but before the final PVC has been recreated.
 
+During cutover, the destination PV is also annotated with the original PVC
+snapshot before either PVC is deleted. That lets a later run continue even if
+the process stops after both PVC objects are gone but before the final PVC is
+created.
+
 Use `kubectl scmigrate run ... --yes` again with the same selection flags to
 continue an interrupted migration.
+
+Keep these flags stable when resuming: `--namespace` or `--all-namespaces`,
+`--selector`, `--annotation`, `--source-storage-class`, and
+`--target-storage-class`. If a resumable object was prepared for a different
+target storage class, the plugin stops instead of continuing with mixed target
+state.
 
 ## Operational Notes
 
 - The source PVC must be bound.
-- The destination storage class must support the requested access modes and
-  volume mode.
+- Only filesystem PVCs are supported. Block-mode PVCs are rejected because the
+  rsync worker mounts PVCs as filesystems.
+- `ReadWriteOncePod` PVCs are rejected because the live initial sync requires a
+  second pod to mount the source PVC.
+- The destination storage class must support the requested access modes,
+  filesystem volume mode, capacity, and any topology required by the source
+  workload.
+- PVC selectors are restored on the final PVC. Static PV selectors that only
+  matched the old PV can prevent the final PVC from binding to the new PV.
 - The rsync image runs as root so it can preserve ownership and mode bits.
+  Namespaces with restricted Pod Security Admission must allow the migration
+  worker pod or run it under a policy that permits the required filesystem
+  operations.
 - The default rsync arguments are:
 
 ```text
 -aHAX --numeric-ids --delete --info=progress2
 ```
 
+- If the source or target filesystem does not support ACLs or extended
+  attributes, override `--rsync-args` to remove `-A` and/or `-X`.
 - The plugin leaves PV reclaim policies as `Retain` by default. Pass
   `--restore-reclaim-policy` to restore the destination PV's original policy
   after cutover.
+- The old PV is intentionally retained after a successful migration. Remove it
+  only after validating the new PVC and application data.
+- `--skip-initial-sync` means the whole data copy happens during the final
+  outage window.
+
+## Supported Workloads
+
+`scmigrate` can quiesce pods owned by:
+
+- standalone Pods
+- Deployments
+- standalone ReplicaSets
+- StatefulSets
+- DaemonSets
+
+Other owners, including Jobs, CronJobs, Argo Rollouts, operator-specific
+controllers, and custom controllers, are rejected rather than guessed. If an
+operator, HPA, or other reconciler can recreate writers while a workload is
+quiesced, pause that reconciler before running the migration.
+
+## Failure Recovery
+
+The migration state is durable across reruns. Use the same command and selection
+flags to resume.
+
+- Before quiesce: rerun the migration; it reuses the prepared destination PVC
+  and sync pod state.
+- After quiesce: rerun the migration promptly. Workloads may intentionally
+  remain scaled down or orphaned until restore completes.
+- During cutover: rerun the migration. The temporary destination PVC or the
+  destination PV cutover record contains the original PVC snapshot needed to
+  recreate the final PVC.
+- After restore: verify the workload, then clean up retained old PVs and any
+  migration-managed ConfigMaps after you no longer need rollback context.
 
 ## Development
 

@@ -1,6 +1,7 @@
 package scmigrate
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"reflect"
@@ -298,6 +299,123 @@ func TestMigrateRestoresCutoverPVCWithoutPreparingAgain(t *testing.T) {
 	}
 	if restored.Annotations[AnnDestinationPVC] != "original-temp" {
 		t.Fatalf("prepare overwrote destination annotation: %#v", restored.Annotations)
+	}
+}
+
+func TestDryRunFreshPVCPrintsFullPlanWithoutDestinationPVC(t *testing.T) {
+	ctx := testContext(t)
+	source := boundPVC("default", "data", "source-pv", "old-sc")
+	client := fake.NewSimpleClientset(
+		source,
+		pv("source-pv", "default", "data", corev1.PersistentVolumeReclaimDelete),
+	)
+	var out bytes.Buffer
+	runner := &Runner{
+		opts: Options{
+			TargetStorageClass: "new-sc",
+			RunnerImage:        "sync-image",
+			RsyncArgs:          "-a",
+			DryRun:             true,
+		},
+		client: client,
+		out:    &out,
+	}
+
+	if err := runner.migrate(ctx, &Migration{Source: source}); err != nil {
+		t.Fatalf("dry-run migrate returned error: %v\n%s", err, out.String())
+	}
+
+	got := out.String()
+	for _, want := range []string{
+		"dry-run: create destination pvc/",
+		"dry-run: run initial sync pod/",
+		"dry-run: store 1 quiesce record(s)",
+		"dry-run: run final sync pod/",
+		"dry-run: delete pvc/data",
+		"dry-run: restore workload(s)",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("dry-run output missing %q:\n%s", want, got)
+		}
+	}
+	if _, err := client.CoreV1().PersistentVolumeClaims("default").Get(ctx, tempPVCName(source), metav1.GetOptions{}); err == nil {
+		t.Fatal("dry-run created a destination PVC")
+	}
+}
+
+func TestPrepareRejectsUnsupportedPVCModes(t *testing.T) {
+	ctx := testContext(t)
+	blockMode := corev1.PersistentVolumeBlock
+	block := boundPVC("default", "block", "block-pv", "old-sc")
+	block.Spec.VolumeMode = &blockMode
+	rwop := boundPVC("default", "rwop", "rwop-pv", "old-sc")
+	rwop.Spec.AccessModes = []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOncePod}
+	runner := &Runner{opts: Options{TargetStorageClass: "new-sc"}, client: fake.NewSimpleClientset(block, rwop), out: io.Discard}
+
+	if err := runner.prepare(ctx, block); err == nil || !strings.Contains(err.Error(), "block volumeMode") {
+		t.Fatalf("prepare block volume error = %v, want block rejection", err)
+	}
+	if err := runner.prepare(ctx, rwop); err == nil || !strings.Contains(err.Error(), "ReadWriteOncePod") {
+		t.Fatalf("prepare rwop error = %v, want ReadWriteOncePod rejection", err)
+	}
+}
+
+func TestDiscoverRejectsTargetStorageClassDrift(t *testing.T) {
+	ctx := testContext(t)
+	source := boundPVC("default", "data", "source-pv", "old-sc")
+	source.Annotations[AnnState] = StatePrepared
+	source.Annotations[AnnTargetStorageClass] = "previous-sc"
+	runner := &Runner{
+		opts:   Options{Namespace: "default", TargetStorageClass: "new-sc"},
+		client: fake.NewSimpleClientset(source, pv("source-pv", "default", "data", corev1.PersistentVolumeReclaimDelete)),
+		out:    io.Discard,
+	}
+
+	_, err := runner.discover(ctx)
+	if err == nil || !strings.Contains(err.Error(), "previous-sc") {
+		t.Fatalf("discover error = %v, want target storage class drift", err)
+	}
+}
+
+func TestResumeCutoverFromPVRecordAfterTemporaryPVCWasDeleted(t *testing.T) {
+	ctx := testContext(t)
+	original := boundPVC("default", "data", "source-pv", "old-sc")
+	snapshot, err := pvcSnapshot(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	destPV := pv("dest-pv", "default", "dest", corev1.PersistentVolumeReclaimRetain)
+	destPV.Annotations[AnnState] = StateFinalSynced
+	destPV.Annotations[AnnSourcePVC] = "data"
+	destPV.Annotations[AnnSourceNamespace] = "default"
+	destPV.Annotations[AnnSourceUID] = string(original.UID)
+	destPV.Annotations[AnnSourcePV] = "source-pv"
+	destPV.Annotations[AnnDestinationPVC] = "dest"
+	destPV.Annotations[AnnDestinationPV] = "dest-pv"
+	destPV.Annotations[AnnTargetStorageClass] = "new-sc"
+	destPV.Annotations[AnnOriginalPVC] = snapshot
+	destPV.Annotations[AnnQuiesce] = `[{"kind":"None","namespace":"default"}]`
+	client := fake.NewSimpleClientset(destPV)
+	bindCreatedPVCs(client)
+	runner := &Runner{opts: Options{TargetStorageClass: "new-sc"}, client: client, out: io.Discard}
+
+	if err := runner.resumeCutoverWithoutSource(ctx, "default", "data"); err != nil {
+		t.Fatalf("resumeCutoverWithoutSource returned error: %v", err)
+	}
+
+	final, err := client.CoreV1().PersistentVolumeClaims("default").Get(ctx, "data", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get final pvc: %v", err)
+	}
+	if final.Spec.VolumeName != "dest-pv" || final.Annotations[AnnQuiesce] == "" {
+		t.Fatalf("unexpected final pvc from PV record: %#v", final)
+	}
+	updatedPV, err := client.CoreV1().PersistentVolumes().Get(ctx, "dest-pv", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get dest pv: %v", err)
+	}
+	if updatedPV.Spec.ClaimRef != nil {
+		t.Fatalf("dest PV claimRef was not cleared: %#v", updatedPV.Spec.ClaimRef)
 	}
 }
 
