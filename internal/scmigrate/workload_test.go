@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"reflect"
+	"strings"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -192,6 +193,49 @@ func TestQuiescePVCSharedByMultipleParentsScalesEveryParent(t *testing.T) {
 	}
 }
 
+func TestQuiesceConvenienceMethodsUseClusterWorkloadState(t *testing.T) {
+	ctx := testContext(t)
+	pvc := testPVC("default", "data")
+	standalone := testPod("default", "standalone", "data", "node-a", metav1.OwnerReference{})
+	deployPod := testPod("default", "app-0", "data", "node-a", controllerRef("ReplicaSet", "app-rs"))
+	rsPod := testPod("default", "worker-0", "data", "node-a", controllerRef("ReplicaSet", "worker-rs"))
+	client := fake.NewSimpleClientset(
+		standalone,
+		testDeployment("default", "app", 2, map[string]string{"app": "app"}),
+		testReplicaSetForDeployment("default", "app-rs", "app", 2),
+		&appsv1.ReplicaSet{
+			ObjectMeta: metav1.ObjectMeta{Name: "worker-rs", Namespace: "default"},
+			Spec:       appsv1.ReplicaSetSpec{Replicas: int32Ptr(1)},
+		},
+	)
+	runner := &Runner{client: client, out: io.Discard}
+
+	record, err := runner.quiescePod(ctx, pvc, standalone)
+	if err != nil {
+		t.Fatalf("quiescePod returned error: %v", err)
+	}
+	if record.Kind != "Pod" || record.PodName != "standalone" {
+		t.Fatalf("unexpected pod record: %#v", record)
+	}
+	record, err = runner.quiesceDeployment(ctx, pvc, deployPod, "app")
+	if err != nil {
+		t.Fatalf("quiesceDeployment returned error: %v", err)
+	}
+	if record.Kind != "Deployment" || record.OriginalReplicas != 2 {
+		t.Fatalf("unexpected deployment record: %#v", record)
+	}
+	record, err = runner.quiesceReplicaSet(ctx, rsPod, &appsv1.ReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "worker-rs", Namespace: "default"},
+		Spec:       appsv1.ReplicaSetSpec{Replicas: int32Ptr(1)},
+	})
+	if err != nil {
+		t.Fatalf("quiesceReplicaSet returned error: %v", err)
+	}
+	if record.Kind != "ReplicaSet" || record.OriginalReplicas != 1 {
+		t.Fatalf("unexpected replicaset record: %#v", record)
+	}
+}
+
 func TestQuiesceRecordsFromAnnotationAcceptsSingleAndArray(t *testing.T) {
 	single := QuiesceRecord{Kind: "Deployment", Namespace: "default", Name: "app", OriginalReplicas: 3}
 	rawSingle, err := json.Marshal(single)
@@ -287,6 +331,344 @@ func TestQuiesceDaemonSetDryRunRecordsOriginalScheduling(t *testing.T) {
 	}
 	if record.DaemonSetAffinity == nil || len(record.DaemonSetAffinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms) != 1 {
 		t.Fatalf("expected original affinity to be recorded, got %#v", record.DaemonSetAffinity)
+	}
+}
+
+func TestQuiesceStandalonePodsDeletesPods(t *testing.T) {
+	ctx := testContext(t)
+	pods := []corev1.Pod{
+		*testPod("default", "standalone-b", "data", "node-b", metav1.OwnerReference{}),
+		*testPod("default", "standalone-a", "data", "node-a", metav1.OwnerReference{}),
+	}
+	client := fake.NewSimpleClientset(&pods[0], &pods[1])
+	runner := &Runner{client: client, out: io.Discard}
+
+	record, err := runner.quiesceStandalonePods(ctx, WorkloadRef{Kind: "Pod", Namespace: "default", Name: "standalone-a"}, pods)
+	if err != nil {
+		t.Fatalf("quiesceStandalonePods returned error: %v", err)
+	}
+	if record.Kind != "Pod" || record.PodName != "standalone-a" || !reflect.DeepEqual(record.PodNames, []string{"standalone-a", "standalone-b"}) {
+		t.Fatalf("unexpected standalone pod record: %#v", record)
+	}
+	for _, name := range []string{"standalone-a", "standalone-b"} {
+		if _, err := client.CoreV1().Pods("default").Get(ctx, name, metav1.GetOptions{}); err == nil {
+			t.Fatalf("pod/%s still exists after quiesce", name)
+		}
+	}
+}
+
+func TestQuiesceReplicaSetConsumersScalesReplicaSetToZero(t *testing.T) {
+	ctx := testContext(t)
+	rs := &appsv1.ReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "worker-rs", Namespace: "default"},
+		Spec:       appsv1.ReplicaSetSpec{Replicas: int32Ptr(2)},
+	}
+	pods := []corev1.Pod{
+		*testPod("default", "worker-1", "data", "node-a", controllerRef("ReplicaSet", "worker-rs")),
+		*testPod("default", "worker-2", "data", "node-b", controllerRef("ReplicaSet", "worker-rs")),
+	}
+	client := fake.NewSimpleClientset(rs)
+	runner := &Runner{client: client, out: io.Discard}
+
+	record, err := runner.quiesceReplicaSetConsumers(ctx, WorkloadRef{Kind: "ReplicaSet", Namespace: "default", Name: "worker-rs"}, pods)
+	if err != nil {
+		t.Fatalf("quiesceReplicaSetConsumers returned error: %v", err)
+	}
+	if record.Kind != "ReplicaSet" || record.Name != "worker-rs" || record.OriginalReplicas != 2 {
+		t.Fatalf("unexpected replicaset record: %#v", record)
+	}
+	got, err := client.AppsV1().ReplicaSets("default").Get(ctx, "worker-rs", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get replicaset: %v", err)
+	}
+	if got.Spec.Replicas == nil || *got.Spec.Replicas != 0 {
+		t.Fatalf("replicaset replicas = %v, want 0", got.Spec.Replicas)
+	}
+}
+
+func TestQuiesceStatefulSetConsumersScalesSharedPVCToZero(t *testing.T) {
+	ctx := testContext(t)
+	sts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "db", Namespace: "default"},
+		Spec:       appsv1.StatefulSetSpec{Replicas: int32Ptr(2)},
+	}
+	pods := []corev1.Pod{
+		*testPod("default", "db-0", "data", "node-a", controllerRef("StatefulSet", "db")),
+		*testPod("default", "db-1", "data", "node-b", controllerRef("StatefulSet", "db")),
+	}
+	client := fake.NewSimpleClientset(sts)
+	runner := &Runner{client: client, out: io.Discard}
+
+	record, err := runner.quiesceStatefulSetConsumers(ctx, WorkloadRef{Kind: "StatefulSet", Namespace: "default", Name: "db"}, pods)
+	if err != nil {
+		t.Fatalf("quiesceStatefulSetConsumers returned error: %v", err)
+	}
+	if record.Kind != "StatefulSet" || record.OriginalReplicas != 2 || !reflect.DeepEqual(record.PodNames, []string{"db-0", "db-1"}) {
+		t.Fatalf("unexpected statefulset record: %#v", record)
+	}
+	got, err := client.AppsV1().StatefulSets("default").Get(ctx, "db", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get statefulset: %v", err)
+	}
+	if got.Spec.Replicas == nil || *got.Spec.Replicas != 0 {
+		t.Fatalf("statefulset replicas = %v, want 0", got.Spec.Replicas)
+	}
+}
+
+func TestQuiesceStatefulSetHighestOrdinalOrphansAndRestoreRecreates(t *testing.T) {
+	ctx := testContext(t)
+	sts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "db", Namespace: "default", UID: "sts-uid"},
+		Spec:       appsv1.StatefulSetSpec{Replicas: int32Ptr(3)},
+		Status:     appsv1.StatefulSetStatus{ReadyReplicas: 3},
+	}
+	pod := testPod("default", "db-2", "data", "node-a", controllerRef("StatefulSet", "db"))
+	client := fake.NewSimpleClientset(sts, pod)
+	runner := &Runner{client: client, out: io.Discard}
+
+	record, err := runner.quiesceStatefulSet(ctx, pod, sts)
+	if err != nil {
+		t.Fatalf("quiesceStatefulSet returned error: %v", err)
+	}
+	if record.Kind != "StatefulSet" || record.OriginalReplicas != 3 || record.StatefulSet == nil {
+		t.Fatalf("unexpected statefulset record: %#v", record)
+	}
+	if _, err := client.AppsV1().StatefulSets("default").Get(ctx, "db", metav1.GetOptions{}); err == nil {
+		t.Fatal("statefulset still exists after orphaning")
+	}
+	if _, err := client.CoreV1().Pods("default").Get(ctx, "db-2", metav1.GetOptions{}); err == nil {
+		t.Fatal("statefulset pod still exists after quiesce")
+	}
+
+	if err := runner.restoreOrphanedStatefulSet(ctx, record); err != nil {
+		t.Fatalf("restoreOrphanedStatefulSet returned error: %v", err)
+	}
+	restored, err := client.AppsV1().StatefulSets("default").Get(ctx, "db", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get restored statefulset: %v", err)
+	}
+	if restored.UID != "" || restored.ResourceVersion != "" || restored.Status.ReadyReplicas != 0 {
+		t.Fatalf("restored statefulset kept server-owned fields: %#v", restored)
+	}
+	if restored.Spec.Replicas == nil || *restored.Spec.Replicas != 3 {
+		t.Fatalf("restored statefulset replicas = %v, want 3", restored.Spec.Replicas)
+	}
+}
+
+func TestQuiesceStatefulSetRejectsNonHighestOrdinal(t *testing.T) {
+	sts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "db", Namespace: "default"},
+		Spec:       appsv1.StatefulSetSpec{Replicas: int32Ptr(3)},
+	}
+	pod := testPod("default", "db-0", "data", "node-a", controllerRef("StatefulSet", "db"))
+	runner := &Runner{client: fake.NewSimpleClientset(), out: io.Discard}
+
+	_, err := runner.quiesceStatefulSet(testContext(t), pod, sts)
+	if err == nil || !strings.Contains(err.Error(), "highest ordinal") {
+		t.Fatalf("quiesceStatefulSet error = %v, want highest ordinal error", err)
+	}
+}
+
+func TestQuiesceDaemonSetConsumersPatchesSchedulingAndDeletesPods(t *testing.T) {
+	ctx := testContext(t)
+	ds := &appsv1.DaemonSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "agent", Namespace: "default"},
+		Spec: appsv1.DaemonSetSpec{
+			UpdateStrategy: appsv1.DaemonSetUpdateStrategy{Type: appsv1.RollingUpdateDaemonSetStrategyType},
+			Template:       corev1.PodTemplateSpec{Spec: corev1.PodSpec{}},
+		},
+	}
+	pods := []corev1.Pod{
+		*testPod("default", "agent-a", "data", "node-a", controllerRef("DaemonSet", "agent")),
+		*testPod("default", "agent-b", "data", "node-b", controllerRef("DaemonSet", "agent")),
+	}
+	client := fake.NewSimpleClientset(ds, &pods[0], &pods[1])
+	runner := &Runner{client: client, out: io.Discard}
+
+	record, err := runner.quiesceDaemonSetConsumers(ctx, WorkloadRef{Kind: "DaemonSet", Namespace: "default", Name: "agent"}, pods)
+	if err != nil {
+		t.Fatalf("quiesceDaemonSetConsumers returned error: %v", err)
+	}
+	if record.Kind != "DaemonSet" || !reflect.DeepEqual(record.NodeNames, []string{"node-a", "node-b"}) {
+		t.Fatalf("unexpected daemonset record: %#v", record)
+	}
+	patched, err := client.AppsV1().DaemonSets("default").Get(ctx, "agent", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get daemonset: %v", err)
+	}
+	if patched.Spec.UpdateStrategy.Type != appsv1.OnDeleteDaemonSetStrategyType {
+		t.Fatalf("daemonset strategy = %s, want OnDelete", patched.Spec.UpdateStrategy.Type)
+	}
+	fields := patched.Spec.Template.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms[0].MatchFields
+	if len(fields) != 1 || fields[0].Operator != corev1.NodeSelectorOpNotIn || !reflect.DeepEqual(fields[0].Values, []string{"node-a", "node-b"}) {
+		t.Fatalf("unexpected daemonset node exclusion: %#v", fields)
+	}
+	for _, name := range []string{"agent-a", "agent-b"} {
+		if _, err := client.CoreV1().Pods("default").Get(ctx, name, metav1.GetOptions{}); err == nil {
+			t.Fatalf("pod/%s still exists after daemonset quiesce", name)
+		}
+	}
+}
+
+func TestRestoreQuiesceRecordRestoresControllerState(t *testing.T) {
+	ctx := testContext(t)
+	rs := &appsv1.ReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "worker-rs", Namespace: "default"},
+		Spec:       appsv1.ReplicaSetSpec{Replicas: int32Ptr(0)},
+	}
+	sts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "db", Namespace: "default"},
+		Spec:       appsv1.StatefulSetSpec{Replicas: int32Ptr(0)},
+	}
+	originalAffinity := &corev1.Affinity{
+		NodeAffinity: &corev1.NodeAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+				NodeSelectorTerms: []corev1.NodeSelectorTerm{{MatchExpressions: []corev1.NodeSelectorRequirement{{
+					Key:      "storage",
+					Operator: corev1.NodeSelectorOpIn,
+					Values:   []string{"fast"},
+				}}}},
+			},
+		},
+	}
+	ds := &appsv1.DaemonSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "agent", Namespace: "default"},
+		Spec: appsv1.DaemonSetSpec{
+			UpdateStrategy: appsv1.DaemonSetUpdateStrategy{Type: appsv1.OnDeleteDaemonSetStrategyType},
+			Template:       corev1.PodTemplateSpec{Spec: corev1.PodSpec{Affinity: excludeNodeFromAffinity(originalAffinity, "node-a")}},
+		},
+	}
+	client := fake.NewSimpleClientset(rs, sts, ds)
+	runner := &Runner{client: client, out: io.Discard}
+
+	records := []QuiesceRecord{
+		{Kind: "ReplicaSet", Namespace: "default", Name: "worker-rs", OriginalReplicas: 2},
+		{Kind: "StatefulSet", Namespace: "default", Name: "db", OriginalReplicas: 1},
+		{
+			Kind:              "DaemonSet",
+			Namespace:         "default",
+			Name:              "agent",
+			DaemonSetStrategy: appsv1.DaemonSetUpdateStrategy{Type: appsv1.RollingUpdateDaemonSetStrategyType},
+			DaemonSetAffinity: originalAffinity,
+		},
+	}
+	for _, record := range records {
+		if err := runner.restoreQuiesceRecord(ctx, record); err != nil {
+			t.Fatalf("restoreQuiesceRecord(%s) returned error: %v", record.Kind, err)
+		}
+	}
+	gotRS, err := client.AppsV1().ReplicaSets("default").Get(ctx, "worker-rs", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get replicaset: %v", err)
+	}
+	if gotRS.Spec.Replicas == nil || *gotRS.Spec.Replicas != 2 {
+		t.Fatalf("replicaset replicas = %v, want 2", gotRS.Spec.Replicas)
+	}
+	gotSTS, err := client.AppsV1().StatefulSets("default").Get(ctx, "db", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get statefulset: %v", err)
+	}
+	if gotSTS.Spec.Replicas == nil || *gotSTS.Spec.Replicas != 1 {
+		t.Fatalf("statefulset replicas = %v, want 1", gotSTS.Spec.Replicas)
+	}
+	gotDS, err := client.AppsV1().DaemonSets("default").Get(ctx, "agent", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get daemonset: %v", err)
+	}
+	if gotDS.Spec.UpdateStrategy.Type != appsv1.RollingUpdateDaemonSetStrategyType || !reflect.DeepEqual(gotDS.Spec.Template.Spec.Affinity, originalAffinity) {
+		t.Fatalf("daemonset was not restored: %#v", gotDS.Spec)
+	}
+}
+
+func TestWaitWorkloadRestoredRecognizesReadyControllers(t *testing.T) {
+	ctx := testContext(t)
+	rs := &appsv1.ReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "worker-rs", Namespace: "default"},
+		Status:     appsv1.ReplicaSetStatus{ReadyReplicas: 2},
+	}
+	sts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "db", Namespace: "default"},
+		Status:     appsv1.StatefulSetStatus{ReadyReplicas: 1},
+	}
+	ds := &appsv1.DaemonSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "agent", Namespace: "default"},
+		Spec: appsv1.DaemonSetSpec{
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "agent"}},
+		},
+	}
+	readyDaemonPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "agent-node-a", Namespace: "default", Labels: map[string]string{"app": "agent"}},
+		Spec:       corev1.PodSpec{NodeName: "node-a"},
+		Status: corev1.PodStatus{
+			Phase:      corev1.PodRunning,
+			Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
+		},
+	}
+	runner := &Runner{client: fake.NewSimpleClientset(rs, sts, ds, readyDaemonPod), out: io.Discard}
+
+	records := []QuiesceRecord{
+		{Kind: "None"},
+		{Kind: "Pod"},
+		{Kind: "ReplicaSet", Namespace: "default", Name: "worker-rs", OriginalReplicas: 2},
+		{Kind: "StatefulSet", Namespace: "default", Name: "db", OriginalReplicas: 1},
+		{Kind: "DaemonSet", Namespace: "default", Name: "agent", NodeNames: []string{"node-a"}},
+	}
+	for _, record := range records {
+		if err := runner.waitWorkloadRestored(ctx, record); err != nil {
+			t.Fatalf("waitWorkloadRestored(%s) returned error: %v", record.Kind, err)
+		}
+	}
+}
+
+func TestStoreQuiesceRecordPatchesSourcePVC(t *testing.T) {
+	ctx := testContext(t)
+	pvc := boundPVC("default", "data", "source-pv", "old-sc")
+	runner := &Runner{client: fake.NewSimpleClientset(pvc), out: io.Discard}
+
+	if err := runner.storeQuiesceRecord(ctx, pvc, QuiesceRecord{Kind: "None", Namespace: "default"}); err != nil {
+		t.Fatalf("storeQuiesceRecord returned error: %v", err)
+	}
+	updated, err := runner.client.CoreV1().PersistentVolumeClaims("default").Get(ctx, "data", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get pvc: %v", err)
+	}
+	records, err := quiesceRecordsFromAnnotation(updated.Annotations[AnnQuiesce])
+	if err != nil {
+		t.Fatalf("decode quiesce annotation: %v", err)
+	}
+	if len(records) != 1 || records[0].Kind != "None" {
+		t.Fatalf("unexpected quiesce annotation: %#v", records)
+	}
+}
+
+func TestQuiesceDeploymentWithZeroReplicasReturnsError(t *testing.T) {
+	deploy := testDeployment("default", "app", 0, map[string]string{"app": "db"})
+	runner := &Runner{client: fake.NewSimpleClientset(deploy), out: io.Discard}
+
+	_, err := runner.quiesceDeploymentConsumers(testContext(t), testPVC("default", "data"), WorkloadRef{Kind: "Deployment", Namespace: "default", Name: "app"}, []corev1.Pod{
+		*testPod("default", "app-0", "data", "node-a", controllerRef("ReplicaSet", "app-rs")),
+	})
+	if err == nil || !strings.Contains(err.Error(), "no replicas") {
+		t.Fatalf("quiesceDeploymentConsumers error = %v, want no replicas", err)
+	}
+}
+
+func TestWorkloadRefForPodRejectsUnsupportedController(t *testing.T) {
+	pod := testPod("default", "job-pod", "data", "node-a", controllerRef("Job", "batch"))
+	runner := &Runner{client: fake.NewSimpleClientset(), out: io.Discard}
+
+	_, err := runner.workloadRefForPod(testContext(t), pod)
+	if err == nil || !strings.Contains(err.Error(), "unsupported pod controller") {
+		t.Fatalf("workloadRefForPod error = %v, want unsupported controller", err)
+	}
+}
+
+func TestRestoreQuiesceRecordRejectsUnsupportedKind(t *testing.T) {
+	runner := &Runner{client: fake.NewSimpleClientset(), out: io.Discard}
+
+	err := runner.restoreQuiesceRecord(testContext(t), QuiesceRecord{Kind: "Job", Namespace: "default", Name: "batch"})
+	if err == nil || !strings.Contains(err.Error(), "unsupported quiesce record") {
+		t.Fatalf("restoreQuiesceRecord error = %v, want unsupported kind", err)
 	}
 }
 

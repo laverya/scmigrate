@@ -16,6 +16,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 )
@@ -112,47 +113,75 @@ func (r *Runner) Run(ctx context.Context) error {
 }
 
 func (r *Runner) migrate(ctx context.Context, migration *Migration) error {
-	if err := r.prepare(ctx, migration); err != nil {
-		return err
-	}
-	if !r.opts.SkipInitialSync && stateBefore(migration.State, StateInitialSynced) {
-		if err := r.runSync(ctx, migration.Source, "initial"); err != nil {
-			return err
-		}
-		if err := r.patchPVCAnnotations(ctx, migration.Source, map[string]string{AnnState: StateInitialSynced}); err != nil {
-			return err
-		}
-		migration.State = StateInitialSynced
-	}
-	if stateBefore(migration.State, StateQuiesced) {
-		if err := r.quiesce(ctx, migration.Source); err != nil {
-			return err
-		}
-		if err := r.patchPVCAnnotations(ctx, migration.Source, map[string]string{AnnState: StateQuiesced}); err != nil {
-			return err
-		}
-		migration.State = StateQuiesced
-	}
-	if stateBefore(migration.State, StateFinalSynced) {
-		if err := r.runSync(ctx, migration.Source, "final"); err != nil {
-			return err
-		}
-		if err := r.patchPVCAnnotations(ctx, migration.Source, map[string]string{AnnState: StateFinalSynced}); err != nil {
-			return err
-		}
-		migration.State = StateFinalSynced
-	}
-	if stateBefore(migration.State, StateCutover) {
+	source := migration.Source
+	source, state, err := r.currentPVCState(ctx, source.Namespace, source.Name)
+	if apierrors.IsNotFound(err) {
 		if err := r.cutover(ctx, migration.Source); err != nil {
 			return err
 		}
-		migration.State = StateCutover
+		source, state, err = r.currentPVCState(ctx, migration.Source.Namespace, migration.Source.Name)
 	}
-	if stateBefore(migration.State, StateRestored) {
-		if err := r.restoreWorkload(ctx, migration.Source); err != nil {
+	if err != nil {
+		return err
+	}
+	if stateBefore(state, StatePrepared) {
+		if err := r.prepare(ctx, source); err != nil {
 			return err
 		}
-		migration.State = StateRestored
+		source, state, err = r.currentPVCState(ctx, source.Namespace, source.Name)
+		if err != nil {
+			return err
+		}
+	}
+	if !r.opts.SkipInitialSync && stateBefore(state, StateInitialSynced) {
+		if err := r.runSync(ctx, source, "initial"); err != nil {
+			return err
+		}
+		if err := r.patchPVCAnnotations(ctx, source, map[string]string{AnnState: StateInitialSynced}); err != nil {
+			return err
+		}
+		source, state, err = r.currentPVCState(ctx, source.Namespace, source.Name)
+		if err != nil {
+			return err
+		}
+	}
+	if stateBefore(state, StateQuiesced) {
+		if err := r.quiesce(ctx, source); err != nil {
+			return err
+		}
+		if err := r.patchPVCAnnotations(ctx, source, map[string]string{AnnState: StateQuiesced}); err != nil {
+			return err
+		}
+		source, state, err = r.currentPVCState(ctx, source.Namespace, source.Name)
+		if err != nil {
+			return err
+		}
+	}
+	if stateBefore(state, StateFinalSynced) {
+		if err := r.runSync(ctx, source, "final"); err != nil {
+			return err
+		}
+		if err := r.patchPVCAnnotations(ctx, source, map[string]string{AnnState: StateFinalSynced}); err != nil {
+			return err
+		}
+		source, state, err = r.currentPVCState(ctx, source.Namespace, source.Name)
+		if err != nil {
+			return err
+		}
+	}
+	if stateBefore(state, StateCutover) {
+		if err := r.cutover(ctx, source); err != nil {
+			return err
+		}
+		source, state, err = r.currentPVCState(ctx, source.Namespace, source.Name)
+		if err != nil {
+			return err
+		}
+	}
+	if stateBefore(state, StateRestored) {
+		if err := r.restoreWorkload(ctx, source); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -206,9 +235,100 @@ func (r *Runner) discover(ctx context.Context) ([]*Migration, error) {
 			migration.Consumers = consumers
 			migrations = append(migrations, migration)
 		}
+		resumable, err := r.discoverResumableDestinations(ctx, namespace)
+		if err != nil {
+			return nil, err
+		}
+		migrations = append(migrations, resumable...)
 	}
 	sortMigrations(migrations)
 	return migrations, nil
+}
+
+func (r *Runner) discoverResumableDestinations(ctx context.Context, namespace string) ([]*Migration, error) {
+	destinations, err := r.client.CoreV1().PersistentVolumeClaims(namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: fmt.Sprintf("%s=scmigrate,%s=destination", LabelManagedBy, LabelRole),
+	})
+	if err != nil {
+		return nil, err
+	}
+	var migrations []*Migration
+	for i := range destinations.Items {
+		dest := destinations.Items[i].DeepCopy()
+		sourceName := dest.Annotations[AnnSourcePVC]
+		if sourceName == "" {
+			continue
+		}
+		if _, err := r.client.CoreV1().PersistentVolumeClaims(namespace).Get(ctx, sourceName, metav1.GetOptions{}); err == nil {
+			continue
+		} else if !apierrors.IsNotFound(err) {
+			return nil, err
+		}
+		stored, err := storedPVC(dest.Annotations[AnnOriginalPVC])
+		if err != nil {
+			return nil, err
+		}
+		matches, err := r.storedPVCMatchesOptions(stored)
+		if err != nil {
+			return nil, err
+		}
+		if !matches {
+			continue
+		}
+		state := dest.Annotations[AnnState]
+		if state == "" {
+			state = StateFinalSynced
+		}
+		source := &corev1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:        sourceName,
+				Namespace:   namespace,
+				UID:         types.UID(dest.Annotations[AnnSourceUID]),
+				Labels:      cloneMap(stored.Labels),
+				Annotations: map[string]string{AnnDestinationPVC: dest.Name, AnnState: state},
+			},
+			Spec: corev1.PersistentVolumeClaimSpec{VolumeName: dest.Annotations[AnnSourcePV]},
+		}
+		migration := &Migration{Source: source, Destination: dest, State: state}
+		if dest.Spec.VolumeName != "" {
+			if destPV, err := r.client.CoreV1().PersistentVolumes().Get(ctx, dest.Spec.VolumeName, metav1.GetOptions{}); err == nil {
+				migration.DestPV = destPV
+			} else if !apierrors.IsNotFound(err) {
+				return nil, err
+			}
+		}
+		migrations = append(migrations, migration)
+	}
+	return migrations, nil
+}
+
+func (r *Runner) storedPVCMatchesOptions(stored *StoredPVC) (bool, error) {
+	if r.opts.Selector != "" {
+		selector, err := labels.Parse(r.opts.Selector)
+		if err != nil {
+			return false, err
+		}
+		if !selector.Matches(labels.Set(stored.Labels)) {
+			return false, nil
+		}
+	}
+	sourceSC := ""
+	if stored.StorageClassName != nil {
+		sourceSC = *stored.StorageClassName
+	}
+	if r.opts.SourceStorageClass != "" && sourceSC != r.opts.SourceStorageClass {
+		return false, nil
+	}
+	for _, filter := range r.opts.AnnotationFilters {
+		key, value, ok := strings.Cut(filter, "=")
+		if !ok || key == "" {
+			return false, nil
+		}
+		if stored.Annotations[key] != value {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 func (r *Runner) skipPVC(pvc *corev1.PersistentVolumeClaim) bool {
@@ -236,8 +356,19 @@ func (r *Runner) skipPVC(pvc *corev1.PersistentVolumeClaim) bool {
 	return false
 }
 
-func (r *Runner) prepare(ctx context.Context, migration *Migration) error {
-	source := migration.Source
+func (r *Runner) currentPVCState(ctx context.Context, namespace, name string) (*corev1.PersistentVolumeClaim, string, error) {
+	pvc, err := r.client.CoreV1().PersistentVolumeClaims(namespace).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return nil, "", err
+	}
+	state := pvc.Annotations[AnnState]
+	if state == "" {
+		state = "new"
+	}
+	return pvc, state, nil
+}
+
+func (r *Runner) prepare(ctx context.Context, source *corev1.PersistentVolumeClaim) error {
 	tempName := tempPVCName(source)
 	snapshot, err := pvcSnapshot(source)
 	if err != nil {
@@ -258,7 +389,6 @@ func (r *Runner) prepare(ctx context.Context, migration *Migration) error {
 	}
 
 	if _, err := r.destinationPVC(ctx, source); err == nil {
-		migration.State = StatePrepared
 		return nil
 	} else if !apierrors.IsNotFound(err) {
 		return err
@@ -304,7 +434,6 @@ func (r *Runner) prepare(ctx context.Context, migration *Migration) error {
 	if err == nil {
 		fmt.Fprintf(r.out, "created destination pvc/%s\n", created.Name)
 	}
-	migration.State = StatePrepared
 	return nil
 }
 

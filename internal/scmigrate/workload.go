@@ -248,9 +248,7 @@ func (r *Runner) quiesceStatefulSet(ctx context.Context, pod *corev1.Pod, sts *a
 		return QuiesceRecord{}, fmt.Errorf("cannot infer ordinal for statefulset pod/%s", pod.Name)
 	}
 	if ordinal != replicas-1 {
-		if replicas <= 1 {
-			return QuiesceRecord{}, fmt.Errorf("statefulset/%s can quiesce one pod safely only at highest ordinal; pod/%s is ordinal %d, current highest is %d. Migrate this StatefulSet in descending ordinal order", sts.Name, pod.Name, ordinal, replicas-1)
-		}
+		return QuiesceRecord{}, fmt.Errorf("statefulset/%s can quiesce one pod safely only at highest ordinal; pod/%s is ordinal %d, current highest is %d. Migrate this StatefulSet in descending ordinal order", sts.Name, pod.Name, ordinal, replicas-1)
 	}
 	record := QuiesceRecord{Kind: "StatefulSet", Name: sts.Name, Namespace: pod.Namespace, OriginalReplicas: replicas, PodName: pod.Name, PodNames: []string{pod.Name}}
 	if r.opts.DryRun {
