@@ -1,0 +1,51 @@
+version: 2
+
+project_name: scmigrate
+
+builds:
+  - id: kubectl-scmigrate
+    main: ./cmd/kubectl-scmigrate
+    binary: kubectl-scmigrate
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ignore:
+      - goos: windows
+        goarch: arm64
+
+archives:
+  - id: kubectl-scmigrate
+    ids:
+      - kubectl-scmigrate
+    formats:
+      - tar.gz
+    name_template: >-
+      {{ .Binary }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    files:
+      - LICENSE
+
+checksum:
+  name_template: checksums.txt
+
+dockers_v2:
+  - id: scmigrate-rsync
+    dockerfile: Dockerfile.rsync
+    images:
+      - ghcr.io/{{ .Env.GITHUB_REPOSITORY_OWNER }}/scmigrate-rsync
+    tags:
+      - "{{ .Tag }}"
+      - "{{ .Version }}"
+      - latest
+    platforms:
+      - linux/amd64
+      - linux/arm64
+    labels:
+      org.opencontainers.image.source: "https://github.com/{{ .Env.GITHUB_REPOSITORY }}"
+      org.opencontainers.image.description: scmigrate rsync runner image
+      org.opencontainers.image.version: "{{ .Tag }}"

@@ -89,14 +89,15 @@ requiring the destination PVC to exist in the cluster.
 
 Status: Resolved.
 
-`go.mod` requires Go 1.26, while `Dockerfile` uses `golang:1.22`. Container
-builds will fail or rely on toolchain auto-download behavior rather than the
-declared build image.
+`go.mod` requires Go 1.26, while the deleted plugin image `Dockerfile` used
+`golang:1.22`. Container builds would fail or rely on toolchain auto-download
+behavior rather than the declared build image.
 
 Suggested direction: update the Docker build image to a Go version compatible
 with `go.mod`, or lower `go.mod` if the code and dependencies support it.
 
-Resolution: the Docker build image now matches the Go 1.26 module version.
+Resolution: the plugin image `Dockerfile` was removed; releases now publish the
+rsync runner image from `Dockerfile.rsync`.
 
 ### P2: Some PVC types are copied but cannot actually be synced
 
