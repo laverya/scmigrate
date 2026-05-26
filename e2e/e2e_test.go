@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"hash/fnv"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -26,18 +28,18 @@ type e2eCase struct {
 	manifest   func(namespace, runID, image string) string
 }
 
+type e2eCluster struct {
+	name        string
+	kubeconfig  string
+	runnerImage string
+	etcdImage   string
+	bin         string
+}
+
 func TestMigrations(t *testing.T) {
 	if os.Getenv("SCMIGRATE_E2E") != "1" {
 		t.Skip("set SCMIGRATE_E2E=1 to run kind-backed e2e tests")
 	}
-	requireEnv(t, "KUBECONFIG")
-	requireEnv(t, "SCMIGRATE_BIN")
-	image := requireEnv(t, "SCMIGRATE_RUNNER_IMAGE")
-
-	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Minute)
-	defer cancel()
-
-	applyYAML(t, ctx, storageClassesYAML())
 
 	runID := fmt.Sprintf("%d", time.Now().UnixNano())
 	cases := []e2eCase{
@@ -68,29 +70,33 @@ func TestMigrations(t *testing.T) {
 	}
 
 	for _, tc := range cases {
+		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
+			cluster, ctx := startE2ECluster(t, 25*time.Minute)
+			applyYAML(t, ctx, cluster, storageClassesYAML())
+
 			namespace := "scmigrate-e2e-" + tc.name
-			createNamespace(t, ctx, namespace)
+			createNamespace(t, ctx, cluster, namespace)
 			t.Cleanup(func() {
 				cleanupCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 				defer cancel()
-				_ = kubectl(cleanupCtx, "delete", "namespace", namespace, "--ignore-not-found=true")
+				_ = cluster.kubectl(cleanupCtx, "delete", "namespace", namespace, "--ignore-not-found=true")
 			})
 
-			applyYAML(t, ctx, tc.manifest(namespace, runID, image))
-			kubectlOK(t, ctx, "rollout", "status", "-n", namespace, tc.rolloutRef, "--timeout=180s")
+			applyYAML(t, ctx, cluster, tc.manifest(namespace, runID, cluster.runnerImage))
+			kubectlOK(t, ctx, cluster, "rollout", "status", "-n", namespace, tc.rolloutRef, "--timeout=180s")
 
-			pod := podName(t, ctx, namespace, tc.podLabel)
+			pod := podName(t, ctx, cluster, namespace, tc.podLabel)
 			proof := fmt.Sprintf("%s proof %s", tc.kind, runID)
-			kubectlOK(t, ctx, "exec", "-n", namespace, pod, "--", "sh", "-c", fmt.Sprintf("printf %%s %q > /data/proof.txt && sync", proof))
-			assertPodFile(t, ctx, namespace, pod, proof)
+			kubectlOK(t, ctx, cluster, "exec", "-n", namespace, pod, "--", "sh", "-c", fmt.Sprintf("printf %%s %q > /data/proof.txt && sync", proof))
+			assertPodFile(t, ctx, cluster, namespace, pod, proof)
 
-			runScmigrate(t, ctx, namespace, tc.name, runID, image)
+			runScmigrate(t, ctx, cluster, namespace, tc.name, runID, cluster.runnerImage)
 
-			kubectlOK(t, ctx, "rollout", "status", "-n", namespace, tc.rolloutRef, "--timeout=240s")
-			assertPVC(t, ctx, namespace, tc.claimName)
-			restoredPod := podName(t, ctx, namespace, tc.podLabel)
-			assertPodFile(t, ctx, namespace, restoredPod, proof)
+			kubectlOK(t, ctx, cluster, "rollout", "status", "-n", namespace, tc.rolloutRef, "--timeout=240s")
+			assertPVC(t, ctx, cluster, namespace, tc.claimName)
+			restoredPod := podName(t, ctx, cluster, namespace, tc.podLabel)
+			assertPodFile(t, ctx, cluster, namespace, restoredPod, proof)
 		})
 	}
 }
@@ -99,114 +105,96 @@ func TestSharedPVCDeploymentReplicas(t *testing.T) {
 	if os.Getenv("SCMIGRATE_E2E") != "1" {
 		t.Skip("set SCMIGRATE_E2E=1 to run kind-backed e2e tests")
 	}
-	requireEnv(t, "KUBECONFIG")
-	requireEnv(t, "SCMIGRATE_BIN")
-	image := requireEnv(t, "SCMIGRATE_RUNNER_IMAGE")
-
-	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Minute)
-	defer cancel()
-
-	applyYAML(t, ctx, storageClassesYAML())
+	cluster, ctx := startE2ECluster(t, 25*time.Minute)
+	applyYAML(t, ctx, cluster, storageClassesYAML())
 
 	runID := fmt.Sprintf("%d", time.Now().UnixNano())
 	namespace := "scmigrate-e2e-shared-deploy"
-	createNamespace(t, ctx, namespace)
+	createNamespace(t, ctx, cluster, namespace)
 	t.Cleanup(func() {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
-		_ = kubectl(cleanupCtx, "delete", "namespace", namespace, "--ignore-not-found=true")
+		_ = cluster.kubectl(cleanupCtx, "delete", "namespace", namespace, "--ignore-not-found=true")
 	})
 
-	applyYAML(t, ctx, sharedDeploymentYAML(namespace, runID, image))
-	kubectlOK(t, ctx, "rollout", "status", "-n", namespace, "deployment/app", "--timeout=240s")
-	assertReadyReplicas(t, ctx, namespace, "app", 3)
+	applyYAML(t, ctx, cluster, sharedDeploymentYAML(namespace, runID, cluster.runnerImage))
+	kubectlOK(t, ctx, cluster, "rollout", "status", "-n", namespace, "deployment/app", "--timeout=240s")
+	assertReadyReplicas(t, ctx, cluster, namespace, "app", 3)
 
-	pod := podName(t, ctx, namespace, "app=scmigrate-e2e-shared-deployment")
+	pod := podName(t, ctx, cluster, namespace, "app=scmigrate-e2e-shared-deployment")
 	proof := "shared deployment proof " + runID
-	kubectlOK(t, ctx, "exec", "-n", namespace, pod, "--", "sh", "-c", fmt.Sprintf("printf %%s %q > /data/proof.txt && sync", proof))
+	kubectlOK(t, ctx, cluster, "exec", "-n", namespace, pod, "--", "sh", "-c", fmt.Sprintf("printf %%s %q > /data/proof.txt && sync", proof))
 
-	runScmigrate(t, ctx, namespace, "shared-deployment", runID, image)
+	runScmigrate(t, ctx, cluster, namespace, "shared-deployment", runID, cluster.runnerImage)
 
-	kubectlOK(t, ctx, "rollout", "status", "-n", namespace, "deployment/app", "--timeout=240s")
-	assertReadyReplicas(t, ctx, namespace, "app", 3)
-	assertPVC(t, ctx, namespace, "data")
-	restoredPod := podName(t, ctx, namespace, "app=scmigrate-e2e-shared-deployment")
-	assertPodFile(t, ctx, namespace, restoredPod, proof)
+	kubectlOK(t, ctx, cluster, "rollout", "status", "-n", namespace, "deployment/app", "--timeout=240s")
+	assertReadyReplicas(t, ctx, cluster, namespace, "app", 3)
+	assertPVC(t, ctx, cluster, namespace, "data")
+	restoredPod := podName(t, ctx, cluster, namespace, "app=scmigrate-e2e-shared-deployment")
+	assertPodFile(t, ctx, cluster, namespace, restoredPod, proof)
 }
 
 func TestSharedPVCMultipleDeployments(t *testing.T) {
 	if os.Getenv("SCMIGRATE_E2E") != "1" {
 		t.Skip("set SCMIGRATE_E2E=1 to run kind-backed e2e tests")
 	}
-	requireEnv(t, "KUBECONFIG")
-	requireEnv(t, "SCMIGRATE_BIN")
-	image := requireEnv(t, "SCMIGRATE_RUNNER_IMAGE")
-
-	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Minute)
-	defer cancel()
-
-	applyYAML(t, ctx, storageClassesYAML())
+	cluster, ctx := startE2ECluster(t, 25*time.Minute)
+	applyYAML(t, ctx, cluster, storageClassesYAML())
 
 	runID := fmt.Sprintf("%d", time.Now().UnixNano())
 	namespace := "scmigrate-e2e-shared-parents"
-	createNamespace(t, ctx, namespace)
+	createNamespace(t, ctx, cluster, namespace)
 	t.Cleanup(func() {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
-		_ = kubectl(cleanupCtx, "delete", "namespace", namespace, "--ignore-not-found=true")
+		_ = cluster.kubectl(cleanupCtx, "delete", "namespace", namespace, "--ignore-not-found=true")
 	})
 
-	applyYAML(t, ctx, sharedMultipleDeploymentsYAML(namespace, runID, image))
-	kubectlOK(t, ctx, "rollout", "status", "-n", namespace, "deployment/api", "--timeout=240s")
-	kubectlOK(t, ctx, "rollout", "status", "-n", namespace, "deployment/worker", "--timeout=240s")
+	applyYAML(t, ctx, cluster, sharedMultipleDeploymentsYAML(namespace, runID, cluster.runnerImage))
+	kubectlOK(t, ctx, cluster, "rollout", "status", "-n", namespace, "deployment/api", "--timeout=240s")
+	kubectlOK(t, ctx, cluster, "rollout", "status", "-n", namespace, "deployment/worker", "--timeout=240s")
 
-	apiPod := podName(t, ctx, namespace, "app=scmigrate-e2e-shared-api")
-	workerPod := podName(t, ctx, namespace, "app=scmigrate-e2e-shared-worker")
+	apiPod := podName(t, ctx, cluster, namespace, "app=scmigrate-e2e-shared-api")
+	workerPod := podName(t, ctx, cluster, namespace, "app=scmigrate-e2e-shared-worker")
 	proof := "shared parents proof " + runID
-	kubectlOK(t, ctx, "exec", "-n", namespace, apiPod, "--", "sh", "-c", fmt.Sprintf("printf %%s %q > /data/proof.txt && sync", proof))
-	assertPodFile(t, ctx, namespace, workerPod, proof)
+	kubectlOK(t, ctx, cluster, "exec", "-n", namespace, apiPod, "--", "sh", "-c", fmt.Sprintf("printf %%s %q > /data/proof.txt && sync", proof))
+	assertPodFile(t, ctx, cluster, namespace, workerPod, proof)
 
-	runScmigrate(t, ctx, namespace, "shared-multi-parent", runID, image)
+	runScmigrate(t, ctx, cluster, namespace, "shared-multi-parent", runID, cluster.runnerImage)
 
-	kubectlOK(t, ctx, "rollout", "status", "-n", namespace, "deployment/api", "--timeout=240s")
-	kubectlOK(t, ctx, "rollout", "status", "-n", namespace, "deployment/worker", "--timeout=240s")
-	assertReadyReplicas(t, ctx, namespace, "api", 2)
-	assertReadyReplicas(t, ctx, namespace, "worker", 1)
-	assertPVC(t, ctx, namespace, "data")
-	assertPodFile(t, ctx, namespace, podName(t, ctx, namespace, "app=scmigrate-e2e-shared-api"), proof)
-	assertPodFile(t, ctx, namespace, podName(t, ctx, namespace, "app=scmigrate-e2e-shared-worker"), proof)
+	kubectlOK(t, ctx, cluster, "rollout", "status", "-n", namespace, "deployment/api", "--timeout=240s")
+	kubectlOK(t, ctx, cluster, "rollout", "status", "-n", namespace, "deployment/worker", "--timeout=240s")
+	assertReadyReplicas(t, ctx, cluster, namespace, "api", 2)
+	assertReadyReplicas(t, ctx, cluster, namespace, "worker", 1)
+	assertPVC(t, ctx, cluster, namespace, "data")
+	assertPodFile(t, ctx, cluster, namespace, podName(t, ctx, cluster, namespace, "app=scmigrate-e2e-shared-api"), proof)
+	assertPodFile(t, ctx, cluster, namespace, podName(t, ctx, cluster, namespace, "app=scmigrate-e2e-shared-worker"), proof)
 }
 
 func TestThreeReplicaStatefulSetEmptyPVCs(t *testing.T) {
 	if os.Getenv("SCMIGRATE_E2E") != "1" {
 		t.Skip("set SCMIGRATE_E2E=1 to run kind-backed e2e tests")
 	}
-	requireEnv(t, "KUBECONFIG")
-	requireEnv(t, "SCMIGRATE_BIN")
-	image := requireEnv(t, "SCMIGRATE_RUNNER_IMAGE")
-
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
-	defer cancel()
-
-	applyYAML(t, ctx, storageClassesYAML())
+	cluster, ctx := startE2ECluster(t, 15*time.Minute)
+	applyYAML(t, ctx, cluster, storageClassesYAML())
 
 	runID := fmt.Sprintf("%d", time.Now().UnixNano())
 	namespace := "scmigrate-e2e-statefulset-3"
-	createNamespace(t, ctx, namespace)
+	createNamespace(t, ctx, cluster, namespace)
 	t.Cleanup(func() {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
-		_ = kubectl(cleanupCtx, "delete", "namespace", namespace, "--ignore-not-found=true")
+		_ = cluster.kubectl(cleanupCtx, "delete", "namespace", namespace, "--ignore-not-found=true")
 	})
 
-	applyYAML(t, ctx, threeReplicaStatefulSetYAML(namespace, runID, image))
-	kubectlOK(t, ctx, "rollout", "status", "-n", namespace, "statefulset/app", "--timeout=240s")
+	applyYAML(t, ctx, cluster, threeReplicaStatefulSetYAML(namespace, runID, cluster.runnerImage))
+	kubectlOK(t, ctx, cluster, "rollout", "status", "-n", namespace, "statefulset/app", "--timeout=240s")
 
-	runScmigrate(t, ctx, namespace, "statefulset-empty", runID, image)
+	runScmigrate(t, ctx, cluster, namespace, "statefulset-empty", runID, cluster.runnerImage)
 
-	kubectlOK(t, ctx, "rollout", "status", "-n", namespace, "statefulset/app", "--timeout=240s")
+	kubectlOK(t, ctx, cluster, "rollout", "status", "-n", namespace, "statefulset/app", "--timeout=240s")
 	for i := 0; i < 3; i++ {
-		assertPVC(t, ctx, namespace, fmt.Sprintf("data-app-%d", i))
+		assertPVC(t, ctx, cluster, namespace, fmt.Sprintf("data-app-%d", i))
 	}
 }
 
@@ -214,37 +202,30 @@ func TestEtcdThreeReplicaStatefulSetReadsWritesDuringMigration(t *testing.T) {
 	if os.Getenv("SCMIGRATE_E2E") != "1" {
 		t.Skip("set SCMIGRATE_E2E=1 to run kind-backed e2e tests")
 	}
-	requireEnv(t, "KUBECONFIG")
-	requireEnv(t, "SCMIGRATE_BIN")
-	runnerImage := requireEnv(t, "SCMIGRATE_RUNNER_IMAGE")
-	etcdImage := requireEnv(t, "ETCD_IMAGE")
-
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
-	defer cancel()
-
-	applyYAML(t, ctx, storageClassesYAML())
+	cluster, ctx := startE2ECluster(t, 20*time.Minute)
+	applyYAML(t, ctx, cluster, storageClassesYAML())
 
 	runID := fmt.Sprintf("%d", time.Now().UnixNano())
 	namespace := "scmigrate-e2e-etcd"
-	createNamespace(t, ctx, namespace)
+	createNamespace(t, ctx, cluster, namespace)
 	t.Cleanup(func() {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
-		_ = kubectl(cleanupCtx, "delete", "namespace", namespace, "--ignore-not-found=true")
+		_ = cluster.kubectl(cleanupCtx, "delete", "namespace", namespace, "--ignore-not-found=true")
 	})
 
-	applyYAML(t, ctx, etcdStatefulSetYAML(namespace, runID, etcdImage))
-	kubectlOK(t, ctx, "rollout", "status", "-n", namespace, "statefulset/etcd", "--timeout=300s")
-	etcdPutGet(t, ctx, namespace, "/scmigrate/seed", "seed-"+runID)
+	applyYAML(t, ctx, cluster, etcdStatefulSetYAML(namespace, runID, cluster.etcdImage))
+	kubectlOK(t, ctx, cluster, "rollout", "status", "-n", namespace, "statefulset/etcd", "--timeout=300s")
+	etcdPutGet(t, ctx, cluster, namespace, "/scmigrate/seed", "seed-"+runID)
 
 	stopWrites := make(chan struct{})
 	writerErr := make(chan error, 1)
 	var writeCount atomic.Int64
 	go func() {
-		writerErr <- runEtcdWriter(ctx, namespace, runID, stopWrites, &writeCount)
+		writerErr <- runEtcdWriter(ctx, cluster, namespace, runID, stopWrites, &writeCount)
 	}()
 
-	migrationErr := runScmigrateE(ctx, namespace, "etcd", runID, runnerImage)
+	migrationErr := runScmigrateE(ctx, cluster, namespace, "etcd", runID, cluster.runnerImage)
 	close(stopWrites)
 	writerResult := <-writerErr
 	if migrationErr != nil {
@@ -257,21 +238,21 @@ func TestEtcdThreeReplicaStatefulSetReadsWritesDuringMigration(t *testing.T) {
 		t.Fatalf("expected at least 3 successful writes during migration, got %d", writeCount.Load())
 	}
 
-	kubectlOK(t, ctx, "rollout", "status", "-n", namespace, "statefulset/etcd", "--timeout=300s")
+	kubectlOK(t, ctx, cluster, "rollout", "status", "-n", namespace, "statefulset/etcd", "--timeout=300s")
 	for i := 0; i < 3; i++ {
-		assertPVC(t, ctx, namespace, fmt.Sprintf("data-etcd-%d", i))
+		assertPVC(t, ctx, cluster, namespace, fmt.Sprintf("data-etcd-%d", i))
 	}
-	etcdPutGet(t, ctx, namespace, "/scmigrate/after", "after-"+runID)
-	got := etcdGet(t, ctx, namespace, "/scmigrate/seed")
+	etcdPutGet(t, ctx, cluster, namespace, "/scmigrate/after", "after-"+runID)
+	got := etcdGet(t, ctx, cluster, namespace, "/scmigrate/seed")
 	if got != "seed-"+runID {
 		t.Fatalf("seed value = %q, want %q", got, "seed-"+runID)
 	}
-	if _, err := etcdExecE(ctx, namespace, "etcdctl", "--endpoints=http://etcd-client:2379", "endpoint", "health"); err != nil {
+	if _, err := etcdExecE(ctx, cluster, namespace, "etcdctl", "--endpoints=http://etcd-client:2379", "endpoint", "health"); err != nil {
 		t.Fatal(err)
 	}
 }
 
-func runEtcdWriter(ctx context.Context, namespace, runID string, stop <-chan struct{}, count *atomic.Int64) error {
+func runEtcdWriter(ctx context.Context, cluster *e2eCluster, namespace, runID string, stop <-chan struct{}, count *atomic.Int64) error {
 	ticker := time.NewTicker(750 * time.Millisecond)
 	defer ticker.Stop()
 	for {
@@ -284,7 +265,7 @@ func runEtcdWriter(ctx context.Context, namespace, runID string, stop <-chan str
 			next := count.Load() + 1
 			value := fmt.Sprintf("live-%s-%d", runID, next)
 			if err := eventually(ctx, 30*time.Second, func(attempt context.Context) error {
-				return etcdPutGetE(attempt, namespace, "/scmigrate/live", value)
+				return etcdPutGetE(attempt, cluster, namespace, "/scmigrate/live", value)
 			}); err != nil {
 				return fmt.Errorf("continuous etcd read/write failed: %w", err)
 			}
@@ -321,15 +302,80 @@ func requireEnv(t *testing.T, key string) string {
 	return value
 }
 
-func createNamespace(t *testing.T, ctx context.Context, namespace string) {
+func startE2ECluster(t *testing.T, timeout time.Duration) (*e2eCluster, context.Context) {
 	t.Helper()
-	kubectlOK(t, ctx, "delete", "namespace", namespace, "--ignore-not-found=true", "--wait=true", "--timeout=120s")
-	kubectlOK(t, ctx, "create", "namespace", namespace)
+	t.Parallel()
+	requireCommand(t, "docker")
+	requireCommand(t, "kind")
+	requireCommand(t, "kubectl")
+
+	cluster := &e2eCluster{
+		name:        clusterName(t),
+		runnerImage: requireEnv(t, "SCMIGRATE_RUNNER_IMAGE"),
+		etcdImage:   requireEnv(t, "ETCD_IMAGE"),
+		bin:         requireEnv(t, "SCMIGRATE_BIN"),
+	}
+
+	setupCtx, setupCancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	defer setupCancel()
+	runCommand(t, setupCtx, "", "kind", []string{"create", "cluster", "--name", cluster.name, "--wait", "120s"})
+	runCommand(t, setupCtx, "", "kind", []string{"load", "docker-image", cluster.runnerImage, "--name", cluster.name})
+
+	cluster.kubeconfig = filepath.Join(t.TempDir(), "kubeconfig")
+	kubeconfig := runCommand(t, setupCtx, "", "kind", []string{"get", "kubeconfig", "--name", cluster.name})
+	if err := os.WriteFile(cluster.kubeconfig, []byte(kubeconfig), 0600); err != nil {
+		t.Fatalf("write kubeconfig: %v", err)
+	}
+
+	t.Cleanup(func() {
+		if os.Getenv("KEEP_E2E_CLUSTER") == "1" {
+			t.Logf("keeping kind cluster %s", cluster.name)
+			return
+		}
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+		defer cancel()
+		_, _ = runCommandE(cleanupCtx, "", "kind", []string{"delete", "cluster", "--name", cluster.name})
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	t.Cleanup(cancel)
+	return cluster, ctx
 }
 
-func runScmigrate(t *testing.T, ctx context.Context, namespace, caseName, runID, image string) {
+func requireCommand(t *testing.T, name string) {
 	t.Helper()
-	output, err := runScmigrateCommand(ctx, namespace, caseName, runID, image)
+	if _, err := exec.LookPath(name); err != nil {
+		t.Fatalf("missing required command: %s", name)
+	}
+}
+
+func clusterName(t *testing.T) string {
+	t.Helper()
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(fmt.Sprintf("%s-%d-%d", t.Name(), os.Getpid(), time.Now().UnixNano())))
+	base := strings.ToLower(t.Name())
+	base = strings.Map(func(r rune) rune {
+		if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' {
+			return r
+		}
+		return '-'
+	}, base)
+	base = strings.Trim(base, "-")
+	if len(base) > 24 {
+		base = base[:24]
+	}
+	return fmt.Sprintf("scmigrate-%s-%08x", base, h.Sum32())
+}
+
+func createNamespace(t *testing.T, ctx context.Context, cluster *e2eCluster, namespace string) {
+	t.Helper()
+	kubectlOK(t, ctx, cluster, "delete", "namespace", namespace, "--ignore-not-found=true", "--wait=true", "--timeout=120s")
+	kubectlOK(t, ctx, cluster, "create", "namespace", namespace)
+}
+
+func runScmigrate(t *testing.T, ctx context.Context, cluster *e2eCluster, namespace, caseName, runID, image string) {
+	t.Helper()
+	output, err := runScmigrateCommand(ctx, cluster, namespace, caseName, runID, image)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -338,8 +384,8 @@ func runScmigrate(t *testing.T, ctx context.Context, namespace, caseName, runID,
 	}
 }
 
-func runScmigrateE(ctx context.Context, namespace, caseName, runID, image string) error {
-	output, err := runScmigrateCommand(ctx, namespace, caseName, runID, image)
+func runScmigrateE(ctx context.Context, cluster *e2eCluster, namespace, caseName, runID, image string) error {
+	output, err := runScmigrateCommand(ctx, cluster, namespace, caseName, runID, image)
 	if err != nil {
 		return err
 	}
@@ -349,13 +395,9 @@ func runScmigrateE(ctx context.Context, namespace, caseName, runID, image string
 	return nil
 }
 
-func runScmigrateCommand(ctx context.Context, namespace, caseName, runID, image string) (string, error) {
+func runScmigrateCommand(ctx context.Context, cluster *e2eCluster, namespace, caseName, runID, image string) (string, error) {
 	selector := fmt.Sprintf("scmigrate-e2e=%s,scmigrate-e2e-run=%s", caseName, runID)
-	bin := os.Getenv("SCMIGRATE_BIN")
-	if bin == "" {
-		return "", fmt.Errorf("SCMIGRATE_BIN is required")
-	}
-	return runCommandE(ctx, bin, []string{
+	return runCommandE(ctx, cluster.kubeconfig, cluster.bin, []string{
 		"run",
 		"--namespace", namespace,
 		"--selector", selector,
@@ -367,21 +409,21 @@ func runScmigrateCommand(ctx context.Context, namespace, caseName, runID, image 
 	})
 }
 
-func assertPVC(t *testing.T, ctx context.Context, namespace, name string) {
+func assertPVC(t *testing.T, ctx context.Context, cluster *e2eCluster, namespace, name string) {
 	t.Helper()
-	storageClass := strings.TrimSpace(kubectlOK(t, ctx, "get", "pvc", "-n", namespace, name, "-o", "jsonpath={.spec.storageClassName}"))
+	storageClass := strings.TrimSpace(kubectlOK(t, ctx, cluster, "get", "pvc", "-n", namespace, name, "-o", "jsonpath={.spec.storageClassName}"))
 	if storageClass != targetStorageClass {
 		t.Fatalf("pvc/%s storageClass = %q, want %q", name, storageClass, targetStorageClass)
 	}
-	state := strings.TrimSpace(kubectlOK(t, ctx, "get", "pvc", "-n", namespace, name, "-o", "jsonpath={.metadata.annotations.scmigrate\\.laverya\\.github\\.com/state}"))
+	state := strings.TrimSpace(kubectlOK(t, ctx, cluster, "get", "pvc", "-n", namespace, name, "-o", "jsonpath={.metadata.annotations.scmigrate\\.laverya\\.github\\.com/state}"))
 	if state != "restored" {
 		t.Fatalf("pvc/%s migration state = %q, want restored", name, state)
 	}
 }
 
-func assertReadyReplicas(t *testing.T, ctx context.Context, namespace, deployment string, want int) {
+func assertReadyReplicas(t *testing.T, ctx context.Context, cluster *e2eCluster, namespace, deployment string, want int) {
 	t.Helper()
-	got := strings.TrimSpace(kubectlOK(t, ctx, "get", "deployment", "-n", namespace, deployment, "-o", "jsonpath={.status.readyReplicas}"))
+	got := strings.TrimSpace(kubectlOK(t, ctx, cluster, "get", "deployment", "-n", namespace, deployment, "-o", "jsonpath={.status.readyReplicas}"))
 	if got == "" {
 		got = "0"
 	}
@@ -390,26 +432,26 @@ func assertReadyReplicas(t *testing.T, ctx context.Context, namespace, deploymen
 	}
 }
 
-func assertPodFile(t *testing.T, ctx context.Context, namespace, pod, want string) {
+func assertPodFile(t *testing.T, ctx context.Context, cluster *e2eCluster, namespace, pod, want string) {
 	t.Helper()
-	got := strings.TrimSpace(kubectlOK(t, ctx, "exec", "-n", namespace, pod, "--", "cat", "/data/proof.txt"))
+	got := strings.TrimSpace(kubectlOK(t, ctx, cluster, "exec", "-n", namespace, pod, "--", "cat", "/data/proof.txt"))
 	if got != want {
 		t.Fatalf("proof data = %q, want %q", got, want)
 	}
 }
 
-func etcdPutGet(t *testing.T, ctx context.Context, namespace, key, value string) {
+func etcdPutGet(t *testing.T, ctx context.Context, cluster *e2eCluster, namespace, key, value string) {
 	t.Helper()
-	if err := etcdPutGetE(ctx, namespace, key, value); err != nil {
+	if err := etcdPutGetE(ctx, cluster, namespace, key, value); err != nil {
 		t.Fatal(err)
 	}
 }
 
-func etcdPutGetE(ctx context.Context, namespace, key, value string) error {
-	if _, err := etcdExecE(ctx, namespace, "etcdctl", "--endpoints=http://etcd-client:2379", "put", key, value); err != nil {
+func etcdPutGetE(ctx context.Context, cluster *e2eCluster, namespace, key, value string) error {
+	if _, err := etcdExecE(ctx, cluster, namespace, "etcdctl", "--endpoints=http://etcd-client:2379", "put", key, value); err != nil {
 		return err
 	}
-	out, err := etcdExecE(ctx, namespace, "etcdctl", "--endpoints=http://etcd-client:2379", "get", key, "--print-value-only")
+	out, err := etcdExecE(ctx, cluster, namespace, "etcdctl", "--endpoints=http://etcd-client:2379", "get", key, "--print-value-only")
 	if err != nil {
 		return err
 	}
@@ -419,22 +461,22 @@ func etcdPutGetE(ctx context.Context, namespace, key, value string) error {
 	return nil
 }
 
-func etcdGet(t *testing.T, ctx context.Context, namespace, key string) string {
+func etcdGet(t *testing.T, ctx context.Context, cluster *e2eCluster, namespace, key string) string {
 	t.Helper()
-	out, err := etcdExecE(ctx, namespace, "etcdctl", "--endpoints=http://etcd-client:2379", "get", key, "--print-value-only")
+	out, err := etcdExecE(ctx, cluster, namespace, "etcdctl", "--endpoints=http://etcd-client:2379", "get", key, "--print-value-only")
 	if err != nil {
 		t.Fatal(err)
 	}
 	return strings.TrimSpace(out)
 }
 
-func etcdExecE(ctx context.Context, namespace string, args ...string) (string, error) {
+func etcdExecE(ctx context.Context, cluster *e2eCluster, namespace string, args ...string) (string, error) {
 	var failures []string
 	for i := 0; i < 3; i++ {
 		pod := fmt.Sprintf("etcd-%d", i)
 		kubectlArgs := append([]string{"exec", "-n", namespace, pod, "--"}, args...)
 		attempt, cancel := context.WithTimeout(ctx, 3*time.Second)
-		out, err := runCommandE(attempt, "kubectl", kubectlArgs)
+		out, err := runCommandE(attempt, cluster.kubeconfig, "kubectl", kubectlArgs)
 		cancel()
 		if err == nil {
 			return out, nil
@@ -444,19 +486,19 @@ func etcdExecE(ctx context.Context, namespace string, args ...string) (string, e
 	return "", fmt.Errorf("all etcd exec attempts failed: %s", strings.Join(failures, "\n"))
 }
 
-func podName(t *testing.T, ctx context.Context, namespace, label string) string {
+func podName(t *testing.T, ctx context.Context, cluster *e2eCluster, namespace, label string) string {
 	t.Helper()
-	out := strings.TrimSpace(kubectlOK(t, ctx, "get", "pods", "-n", namespace, "-l", label, "-o", "jsonpath={.items[0].metadata.name}"))
+	out := strings.TrimSpace(kubectlOK(t, ctx, cluster, "get", "pods", "-n", namespace, "-l", label, "-o", "jsonpath={.items[0].metadata.name}"))
 	if out == "" {
 		t.Fatalf("no pod found for label %q in namespace %q", label, namespace)
 	}
 	return out
 }
 
-func applyYAML(t *testing.T, ctx context.Context, yaml string) {
+func applyYAML(t *testing.T, ctx context.Context, cluster *e2eCluster, yaml string) {
 	t.Helper()
 	cmd := exec.CommandContext(ctx, "kubectl", "apply", "-f", "-")
-	cmd.Env = commandEnv()
+	cmd.Env = commandEnv(cluster.kubeconfig)
 	cmd.Stdin = strings.NewReader(yaml)
 	var out bytes.Buffer
 	cmd.Stdout = &out
@@ -466,29 +508,29 @@ func applyYAML(t *testing.T, ctx context.Context, yaml string) {
 	}
 }
 
-func kubectlOK(t *testing.T, ctx context.Context, args ...string) string {
+func kubectlOK(t *testing.T, ctx context.Context, cluster *e2eCluster, args ...string) string {
 	t.Helper()
-	return runCommand(t, ctx, "kubectl", args)
+	return runCommand(t, ctx, cluster.kubeconfig, "kubectl", args)
 }
 
-func kubectl(ctx context.Context, args ...string) error {
+func (cluster *e2eCluster) kubectl(ctx context.Context, args ...string) error {
 	cmd := exec.CommandContext(ctx, "kubectl", args...)
-	cmd.Env = commandEnv()
+	cmd.Env = commandEnv(cluster.kubeconfig)
 	return cmd.Run()
 }
 
-func runCommand(t *testing.T, ctx context.Context, name string, args []string) string {
+func runCommand(t *testing.T, ctx context.Context, kubeconfig, name string, args []string) string {
 	t.Helper()
-	out, err := runCommandE(ctx, name, args)
+	out, err := runCommandE(ctx, kubeconfig, name, args)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return out
 }
 
-func runCommandE(ctx context.Context, name string, args []string) (string, error) {
+func runCommandE(ctx context.Context, kubeconfig, name string, args []string) (string, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
-	cmd.Env = commandEnv()
+	cmd.Env = commandEnv(kubeconfig)
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &out
@@ -498,9 +540,15 @@ func runCommandE(ctx context.Context, name string, args []string) (string, error
 	return out.String(), nil
 }
 
-func commandEnv() []string {
-	env := os.Environ()
-	if kubeconfig := os.Getenv("KUBECONFIG"); kubeconfig != "" {
+func commandEnv(kubeconfig string) []string {
+	env := make([]string, 0, len(os.Environ())+1)
+	for _, entry := range os.Environ() {
+		if strings.HasPrefix(entry, "KUBECONFIG=") {
+			continue
+		}
+		env = append(env, entry)
+	}
+	if kubeconfig != "" {
 		env = append(env, "KUBECONFIG="+kubeconfig)
 	}
 	return env
