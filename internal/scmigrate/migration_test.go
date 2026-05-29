@@ -180,7 +180,7 @@ func TestMigrateResumesFromClusterStateInsteadOfMigrationStruct(t *testing.T) {
 	runner := &Runner{
 		opts: Options{
 			TargetStorageClass: "new-sc",
-			RunnerImage:        "sync-image",
+			RunnerImage:        "sync-image:v1",
 			RsyncArgs:          "-a",
 		},
 		client: client,
@@ -313,7 +313,7 @@ func TestDryRunFreshPVCPrintsFullPlanWithoutDestinationPVC(t *testing.T) {
 	runner := &Runner{
 		opts: Options{
 			TargetStorageClass: "new-sc",
-			RunnerImage:        "sync-image",
+			RunnerImage:        "sync-image:v1",
 			RsyncArgs:          "-a",
 			DryRun:             true,
 		},
@@ -434,7 +434,7 @@ func TestMigrateRunsAllPhasesFromFreshPVCUsingClusterState(t *testing.T) {
 	runner := &Runner{
 		opts: Options{
 			TargetStorageClass:   "new-sc",
-			RunnerImage:          "sync-image",
+			RunnerImage:          "sync-image:v1",
 			RsyncArgs:            "-a",
 			RestoreReclaimPolicy: true,
 		},
@@ -476,6 +476,8 @@ func TestMigrateRunsAllPhasesFromFreshPVCUsingClusterState(t *testing.T) {
 	if destPV.Spec.ClaimRef != nil {
 		t.Fatalf("dest PV claimRef was not cleared: %#v", destPV.Spec.ClaimRef)
 	}
+	assertDeleteUIDPrecondition(t, client.Actions(), "persistentvolumeclaims", "data", source.UID)
+	assertDeleteUIDPrecondition(t, client.Actions(), "persistentvolumeclaims", destName, types.UID(destName+"-uid"))
 }
 
 func TestRunSyncCreatesPinnedInitialSyncPodAndCleansItUp(t *testing.T) {
@@ -491,7 +493,7 @@ func TestRunSyncCreatesPinnedInitialSyncPodAndCleansItUp(t *testing.T) {
 	var createdPods []corev1.Pod
 	succeedCreatedPods(client, &createdPods)
 	runner := &Runner{
-		opts:   Options{TargetStorageClass: "new-sc", RunnerImage: "sync-image", RsyncArgs: "-a --delete"},
+		opts:   Options{TargetStorageClass: "new-sc", RunnerImage: "sync-image:v1", RsyncArgs: "-a --delete"},
 		client: client,
 		out:    io.Discard,
 	}
@@ -511,11 +513,74 @@ func TestRunSyncCreatesPinnedInitialSyncPodAndCleansItUp(t *testing.T) {
 	if !reflect.DeepEqual(values, []string{"node-a"}) {
 		t.Fatalf("sync pod node affinity values = %#v, want node-a", values)
 	}
-	if pod.Spec.Containers[0].Image != "sync-image" || !reflect.DeepEqual(pod.Spec.Containers[0].Args, []string{"rsync -a --delete /source/ /destination/"}) {
+	if pod.Spec.Containers[0].Image != "sync-image:v1" || !reflect.DeepEqual(pod.Spec.Containers[0].Command, []string{"rsync"}) || !reflect.DeepEqual(pod.Spec.Containers[0].Args, []string{"-a", "--delete", "/source/", "/destination/"}) {
 		t.Fatalf("unexpected sync container: %#v", pod.Spec.Containers[0])
 	}
 	if _, err := client.CoreV1().Pods("default").Get(ctx, pod.Name, metav1.GetOptions{}); err == nil {
 		t.Fatalf("sync pod %s still exists after cleanup", pod.Name)
+	}
+	assertDeleteUIDPrecondition(t, client.Actions(), "pods", pod.Name, pod.UID)
+}
+
+func TestValidateRunnerImageRequiresPinnedOrVersionedReference(t *testing.T) {
+	for _, image := range []string{"sync-image:v1", "registry:5000/sync-image:v1", "sync-image@sha256:abc"} {
+		if err := validateRunnerImage(image); err != nil {
+			t.Fatalf("validateRunnerImage(%q) returned error: %v", image, err)
+		}
+	}
+	for _, image := range []string{"", "sync-image", "sync-image:latest", "registry:5000/sync-image", "sync-image@", "@sha256:abc", "sync-image@sha256:"} {
+		if err := validateRunnerImage(image); err == nil {
+			t.Fatalf("validateRunnerImage(%q) returned nil, want error", image)
+		}
+	}
+}
+
+func TestCutoverAbortsIfConsumerReappearsAfterFinalSync(t *testing.T) {
+	ctx := testContext(t)
+	source := boundPVC("default", "data", "source-pv", "old-sc")
+	source.Annotations[AnnDestinationPVC] = "dest"
+	snapshot, err := pvcSnapshot(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dest := boundPVC("default", "dest", "dest-pv", "new-sc")
+	dest.Labels[LabelManagedBy] = ManagedByValue
+	dest.Labels[LabelRole] = "destination"
+	dest.Annotations[AnnOriginalPVC] = snapshot
+	dest.Annotations[AnnTargetStorageClass] = "new-sc"
+	client := fake.NewSimpleClientset(
+		source,
+		dest,
+		pv("source-pv", "default", "data", corev1.PersistentVolumeReclaimDelete),
+		pv("dest-pv", "default", "dest", corev1.PersistentVolumeReclaimDelete),
+		testPod("default", "late-writer", "data", "node-a", metav1.OwnerReference{}),
+	)
+	runner := &Runner{opts: Options{TargetStorageClass: "new-sc"}, client: client, out: io.Discard}
+
+	err = runner.cutover(ctx, source)
+	if err == nil || !strings.Contains(err.Error(), "active consumer") {
+		t.Fatalf("cutover error = %v, want active consumer rejection", err)
+	}
+	if _, err := client.CoreV1().PersistentVolumeClaims("default").Get(ctx, "data", metav1.GetOptions{}); err != nil {
+		t.Fatalf("source PVC was deleted despite active consumer: %v", err)
+	}
+}
+
+func TestClearPVClaimRefUsesUIDAndClaimRefTests(t *testing.T) {
+	ctx := testContext(t)
+	destPV := pv("dest-pv", "default", "dest", corev1.PersistentVolumeReclaimRetain)
+	client := fake.NewSimpleClientset(destPV)
+	runner := &Runner{client: client, out: io.Discard}
+
+	if err := runner.clearPVClaimRef(ctx, "dest-pv"); err != nil {
+		t.Fatalf("clearPVClaimRef returned error: %v", err)
+	}
+
+	patch := patchForAction(t, client.Actions(), "persistentvolumes", "dest-pv")
+	for _, want := range []string{`"/metadata/uid"`, `"` + string(destPV.UID) + `"`, `"/spec/claimRef/name"`, `"/spec/claimRef/uid"`} {
+		if !strings.Contains(string(patch), want) {
+			t.Fatalf("patch %s missing %s", patch, want)
+		}
 	}
 }
 
@@ -675,7 +740,7 @@ func boundPVC(namespace, name, volumeName, storageClassName string) *corev1.Pers
 
 func pv(name, namespace, claimName string, reclaimPolicy corev1.PersistentVolumeReclaimPolicy) *corev1.PersistentVolume {
 	return &corev1.PersistentVolume{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Annotations: map[string]string{}},
+		ObjectMeta: metav1.ObjectMeta{Name: name, UID: types.UID(name + "-uid"), Annotations: map[string]string{}},
 		Spec: corev1.PersistentVolumeSpec{
 			Capacity: corev1.ResourceList{
 				corev1.ResourceStorage: resource.MustParse("10Gi"),
@@ -686,6 +751,7 @@ func pv(name, namespace, claimName string, reclaimPolicy corev1.PersistentVolume
 				Kind:      "PersistentVolumeClaim",
 				Namespace: namespace,
 				Name:      claimName,
+				UID:       types.UID(claimName + "-uid"),
 			},
 		},
 	}
@@ -703,6 +769,9 @@ func succeedCreatedPods(client *fake.Clientset, created *[]corev1.Pod) {
 	client.Fake.PrependReactor("create", "pods", func(action ktesting.Action) (bool, runtime.Object, error) {
 		create := action.(ktesting.CreateAction)
 		pod := create.GetObject().(*corev1.Pod).DeepCopy()
+		if pod.UID == "" {
+			pod.UID = types.UID(pod.Name + "-uid")
+		}
 		pod.Status.Phase = corev1.PodSucceeded
 		if created != nil {
 			*created = append(*created, *pod.DeepCopy())
@@ -716,6 +785,9 @@ func bindCreatedPVCs(client *fake.Clientset) {
 	client.Fake.PrependReactor("create", "persistentvolumeclaims", func(action ktesting.Action) (bool, runtime.Object, error) {
 		create := action.(ktesting.CreateAction)
 		pvc := create.GetObject().(*corev1.PersistentVolumeClaim).DeepCopy()
+		if pvc.UID == "" {
+			pvc.UID = types.UID(pvc.Name + "-uid")
+		}
 		if pvc.Spec.VolumeName != "" {
 			pvc.Status.Phase = corev1.ClaimBound
 		}
@@ -728,6 +800,9 @@ func bindCreatedPVCsToPV(client *fake.Clientset, pvName string) {
 	client.Fake.PrependReactor("create", "persistentvolumeclaims", func(action ktesting.Action) (bool, runtime.Object, error) {
 		create := action.(ktesting.CreateAction)
 		pvc := create.GetObject().(*corev1.PersistentVolumeClaim).DeepCopy()
+		if pvc.UID == "" {
+			pvc.UID = types.UID(pvc.Name + "-uid")
+		}
 		if pvc.Labels[LabelRole] == "destination" && pvc.Spec.VolumeName == "" {
 			pvc.Spec.VolumeName = pvName
 		}
@@ -753,4 +828,38 @@ func syncPodPhases(pods []corev1.Pod) []string {
 		phases = append(phases, pod.Name)
 	}
 	return phases
+}
+
+func assertDeleteUIDPrecondition(t *testing.T, actions []ktesting.Action, resource, name string, uid types.UID) {
+	t.Helper()
+	for _, action := range actions {
+		if !action.Matches("delete", resource) {
+			continue
+		}
+		deleteAction := action.(ktesting.DeleteAction)
+		if deleteAction.GetName() != name {
+			continue
+		}
+		opts := deleteAction.GetDeleteOptions()
+		if opts.Preconditions == nil || opts.Preconditions.UID == nil || *opts.Preconditions.UID != uid {
+			t.Fatalf("delete %s/%s preconditions = %#v, want UID %s", resource, name, opts.Preconditions, uid)
+		}
+		return
+	}
+	t.Fatalf("delete action for %s/%s not found in %#v", resource, name, actions)
+}
+
+func patchForAction(t *testing.T, actions []ktesting.Action, resource, name string) []byte {
+	t.Helper()
+	for _, action := range actions {
+		if !action.Matches("patch", resource) {
+			continue
+		}
+		patchAction := action.(ktesting.PatchAction)
+		if patchAction.GetName() == name {
+			return patchAction.GetPatch()
+		}
+	}
+	t.Fatalf("patch action for %s/%s not found in %#v", resource, name, actions)
+	return nil
 }

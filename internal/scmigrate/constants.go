@@ -24,6 +24,8 @@ const (
 
 	ManagedByValue = "scmigrate"
 
+	DefaultRsyncArgs = "-aHAX --numeric-ids --delete --info=progress2"
+
 	StateNew           = "new"
 	StatePrepared      = "prepared"
 	StateInitialSynced = "initial-synced"

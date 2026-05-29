@@ -163,16 +163,19 @@ func (r *Runner) restoreDaemonSet(ctx context.Context, record QuiesceRecord) err
 	if strategy.Type == "" {
 		strategy.Type = appsv1.RollingUpdateDaemonSetStrategyType
 	}
-	payload := map[string]any{
-		"spec": map[string]any{
-			"updateStrategy": strategy,
-			"template": map[string]any{
-				"spec": map[string]any{"affinity": record.DaemonSetAffinity},
-			},
-		},
+	ds, err := r.client.AppsV1().DaemonSets(record.Namespace).Get(ctx, record.Name, metav1.GetOptions{})
+	if err != nil {
+		return err
 	}
-	data, _ := json.Marshal(payload)
-	_, err := r.client.AppsV1().DaemonSets(record.Namespace).Patch(ctx, record.Name, types.MergePatchType, data, metav1.PatchOptions{})
+	data, err := jsonPatchWithUIDTest(
+		ds.UID,
+		jsonPatchOperation{Op: "add", Path: "/spec/updateStrategy", Value: strategy},
+		jsonPatchOperation{Op: "add", Path: "/spec/template/spec/affinity", Value: record.DaemonSetAffinity},
+	)
+	if err != nil {
+		return err
+	}
+	_, err = r.client.AppsV1().DaemonSets(record.Namespace).Patch(ctx, record.Name, types.JSONPatchType, data, metav1.PatchOptions{})
 	return err
 }
 

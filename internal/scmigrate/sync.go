@@ -3,6 +3,7 @@ package scmigrate
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -86,6 +87,9 @@ func (r *Runner) prepare(ctx context.Context, source *corev1.PersistentVolumeCla
 }
 
 func (r *Runner) runSync(ctx context.Context, source *corev1.PersistentVolumeClaim, phase string) error {
+	if err := validateRunnerImage(r.opts.RunnerImage); err != nil {
+		return err
+	}
 	dest, err := r.destinationPVC(ctx, source)
 	if err != nil {
 		return err
@@ -101,7 +105,7 @@ func (r *Runner) runSync(ctx context.Context, source *corev1.PersistentVolumeCla
 			return r.cleanupSyncPod(ctx, source.Namespace, podName)
 		}
 		if old.Status.Phase == corev1.PodFailed {
-			_ = r.client.CoreV1().Pods(source.Namespace).Delete(ctx, podName, metav1.DeleteOptions{})
+			_ = r.deletePod(ctx, old)
 			if err := r.waitPodGone(ctx, source.Namespace, podName); err != nil {
 				return err
 			}
@@ -115,7 +119,10 @@ func (r *Runner) runSync(ctx context.Context, source *corev1.PersistentVolumeCla
 		return err
 	}
 
-	args := []string{"sh", "-c", fmt.Sprintf("rsync %s /source/ /destination/", r.opts.RsyncArgs)}
+	command, args, err := rsyncCommand(r.opts.RsyncArgs)
+	if err != nil {
+		return err
+	}
 	nodeName := ""
 	if phase == SyncPhaseInitial {
 		// For WaitForFirstConsumer or topology-constrained storage, the initial
@@ -146,8 +153,8 @@ func (r *Runner) runSync(ctx context.Context, source *corev1.PersistentVolumeCla
 				Name:            "rsync",
 				Image:           r.opts.RunnerImage,
 				ImagePullPolicy: corev1.PullIfNotPresent,
-				Command:         args[:2],
-				Args:            args[2:],
+				Command:         command,
+				Args:            args,
 				SecurityContext: &corev1.SecurityContext{
 					RunAsUser:  ptrInt64(0),
 					RunAsGroup: ptrInt64(0),
@@ -177,11 +184,7 @@ func (r *Runner) runSync(ctx context.Context, source *corev1.PersistentVolumeCla
 }
 
 func (r *Runner) cleanupSyncPod(ctx context.Context, namespace, name string) error {
-	err := r.client.CoreV1().Pods(namespace).Delete(ctx, name, metav1.DeleteOptions{})
-	if apierrors.IsNotFound(err) {
-		return nil
-	}
-	if err != nil {
+	if err := r.deletePodByName(ctx, namespace, name); err != nil {
 		return err
 	}
 	return r.waitPodGone(ctx, namespace, name)
@@ -221,4 +224,53 @@ func affinityForNode(nodeName string) *corev1.Affinity {
 			},
 		},
 	}
+}
+
+func rsyncCommand(rawArgs string) ([]string, []string, error) {
+	args := strings.Fields(rawArgs)
+	if len(args) == 0 {
+		return nil, nil, fmt.Errorf("rsync args are empty")
+	}
+	args = append(args, "/source/", "/destination/")
+	return []string{"rsync"}, args, nil
+}
+
+func validateRunnerImage(image string) error {
+	image = strings.TrimSpace(image)
+	if image == "" {
+		return fmt.Errorf("--runner-image is required for run; use a non-latest tag or digest")
+	}
+	hasDigest := hasDigestReference(image)
+	if strings.Contains(image, "@") && !hasDigest {
+		return fmt.Errorf("--runner-image digest references must use image@algorithm:value")
+	}
+	if hasDigest {
+		return nil
+	}
+	tag := imageTag(image)
+	if tag == "" {
+		return fmt.Errorf("--runner-image must include a non-latest tag or digest")
+	}
+	if tag == "latest" {
+		return fmt.Errorf("--runner-image must not use the latest tag; use a version tag or digest")
+	}
+	return nil
+}
+
+func imageTag(image string) string {
+	lastSlash := strings.LastIndex(image, "/")
+	lastColon := strings.LastIndex(image, ":")
+	if lastColon <= lastSlash {
+		return ""
+	}
+	return image[lastColon+1:]
+}
+
+func hasDigestReference(image string) bool {
+	name, digest, found := strings.Cut(image, "@")
+	if !found || name == "" || digest == "" || strings.Contains(digest, "@") {
+		return false
+	}
+	algorithm, encoded, found := strings.Cut(digest, ":")
+	return found && algorithm != "" && encoded != ""
 }

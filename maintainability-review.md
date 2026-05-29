@@ -72,16 +72,22 @@ on operational risk:
 - Cutover intentionally deletes the source PVC and temporary destination PVC,
   clears the destination PV `claimRef`, then recreates the final PVC. The resume
   model reduces the risk, but the operation is still high-impact.
-- Consumer discovery only considers running pods, so pending or newly-created
-  writer pods can escape the quiesce calculation.
-- Destructive operations do not use UID preconditions, which leaves room for
-  same-name object races between discovery and mutation.
-- The rsync worker runs as root, and rsync arguments are passed through `sh -c`.
-- The default runner image tag is `latest`, which is weak for production change
-  control.
+- Consumer discovery now considers all non-terminal pods and rechecks for
+  active consumers immediately before cutover. A hostile reviewer can still
+  point at the remaining race window between that last recheck and the PVC/PV
+  mutations if an external actor creates new writers at exactly the wrong time.
+- The highest-risk deletes now use UID preconditions, and controller/PV
+  claimRef patches use JSON Patch tests where the current UID is known. A
+  reviewer can still ask for wider UID guards on non-destructive metadata and
+  reclaim-policy patches.
+- The rsync worker still runs as root so it can preserve ownership and
+  filesystem metadata, but rsync is now invoked directly with explicit command
+  and argument vectors instead of through `sh -c`.
+- `run` no longer defaults to `latest`; release-versioned binaries default to
+  the matching runner image tag, and dev builds require an explicit non-`latest`
+  tag or digest.
 - Dry-run is a local textual projection. It does not prove RBAC, admission,
   binding, scheduling, or Pod Security success.
 - Application consistency is outside the tool's proof. The tool stops writers
   and copies files, but it does not provide database-aware hooks, fsfreeze, or
   application-level flush verification.
-

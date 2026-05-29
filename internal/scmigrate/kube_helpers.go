@@ -10,18 +10,26 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/types"
 )
+
+type jsonPatchOperation struct {
+	Op    string `json:"op"`
+	Path  string `json:"path"`
+	Value any    `json:"value,omitempty"`
+}
 
 func (r *Runner) patchPVCAnnotations(ctx context.Context, pvc *corev1.PersistentVolumeClaim, annotations map[string]string) error {
 	if r.opts.DryRun {
 		fmt.Fprintf(r.out, "dry-run: patch pvc/%s annotations %v\n", pvc.Name, sortedKeys(annotations))
 		return nil
 	}
-	payload := map[string]any{"metadata": map[string]any{"annotations": annotations}}
-	data, _ := json.Marshal(payload)
-	_, err := r.client.CoreV1().PersistentVolumeClaims(pvc.Namespace).Patch(ctx, pvc.Name, types.MergePatchType, data, metav1.PatchOptions{})
+	merged := mergedStringMap(pvc.Annotations, annotations)
+	data, err := jsonPatchWithUIDTest(pvc.UID, jsonPatchOperation{Op: "add", Path: "/metadata/annotations", Value: merged})
+	if err != nil {
+		return err
+	}
+	_, err = r.client.CoreV1().PersistentVolumeClaims(pvc.Namespace).Patch(ctx, pvc.Name, types.JSONPatchType, data, metav1.PatchOptions{})
 	return err
 }
 
@@ -68,15 +76,35 @@ func (r *Runner) waitPodSucceeded(ctx context.Context, namespace, name string) e
 	})
 }
 
+func (r *Runner) deletePodByName(ctx context.Context, namespace, name string) error {
+	pod, err := r.client.CoreV1().Pods(namespace).Get(ctx, name, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return r.deletePod(ctx, pod)
+}
+
+func (r *Runner) deletePod(ctx context.Context, pod *corev1.Pod) error {
+	err := r.client.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name, deleteOptionsForUID(pod.UID))
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	return err
+}
+
 func (r *Runner) consumingPods(ctx context.Context, pvc *corev1.PersistentVolumeClaim) ([]corev1.Pod, error) {
-	pods, err := r.client.CoreV1().Pods(pvc.Namespace).List(ctx, metav1.ListOptions{
-		FieldSelector: fields.OneTermEqualSelector("status.phase", string(corev1.PodRunning)).String(),
-	})
+	pods, err := r.client.CoreV1().Pods(pvc.Namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return nil, err
 	}
 	var consumers []corev1.Pod
 	for _, pod := range pods.Items {
+		if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+			continue
+		}
 		for _, volume := range pod.Spec.Volumes {
 			if volume.PersistentVolumeClaim != nil && volume.PersistentVolumeClaim.ClaimName == pvc.Name {
 				consumers = append(consumers, pod)
@@ -85,6 +113,17 @@ func (r *Runner) consumingPods(ctx context.Context, pvc *corev1.PersistentVolume
 		}
 	}
 	return consumers, nil
+}
+
+func (r *Runner) ensureNoActiveConsumers(ctx context.Context, pvc *corev1.PersistentVolumeClaim) error {
+	consumers, err := r.consumingPods(ctx, pvc)
+	if err != nil {
+		return err
+	}
+	if len(consumers) == 0 {
+		return nil
+	}
+	return fmt.Errorf("pvc/%s still has active consumer pod(s): %v", pvc.Name, podNames(consumers))
 }
 
 func (r *Runner) pvcConsumers(ctx context.Context, pvc *corev1.PersistentVolumeClaim) ([]PVCConsumer, error) {
@@ -205,4 +244,38 @@ func normalizeMigrationState(state string) (string, error) {
 
 func ptrInt64(value int64) *int64 {
 	return &value
+}
+
+func deleteOptionsForUID(uid types.UID) metav1.DeleteOptions {
+	opts := metav1.DeleteOptions{}
+	if uid != "" {
+		uid := uid
+		opts.Preconditions = &metav1.Preconditions{UID: &uid}
+	}
+	return opts
+}
+
+func deleteOptionsForUIDWithPropagation(uid types.UID, policy metav1.DeletionPropagation) metav1.DeleteOptions {
+	opts := deleteOptionsForUID(uid)
+	opts.PropagationPolicy = &policy
+	return opts
+}
+
+func jsonPatchWithUIDTest(uid types.UID, ops ...jsonPatchOperation) ([]byte, error) {
+	if uid != "" {
+		ops = append([]jsonPatchOperation{{
+			Op:    "test",
+			Path:  "/metadata/uid",
+			Value: string(uid),
+		}}, ops...)
+	}
+	return json.Marshal(ops)
+}
+
+func mergedStringMap(base, updates map[string]string) map[string]string {
+	merged := cloneMap(base)
+	for key, value := range updates {
+		merged[key] = value
+	}
+	return merged
 }

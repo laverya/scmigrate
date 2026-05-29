@@ -2,7 +2,6 @@ package scmigrate
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -35,8 +34,7 @@ func (r *Runner) applyQuiesceRecord(ctx context.Context, record QuiesceRecord) e
 			return nil
 		}
 		for _, name := range names {
-			err := r.client.CoreV1().Pods(record.Namespace).Delete(ctx, name, metav1.DeleteOptions{})
-			if err != nil && !apierrors.IsNotFound(err) {
+			if err := r.deletePodByName(ctx, record.Namespace, name); err != nil {
 				return err
 			}
 		}
@@ -91,8 +89,7 @@ func (r *Runner) applyQuiesceRecord(ctx context.Context, record QuiesceRecord) e
 			return err
 		}
 		for _, name := range names {
-			err := r.client.CoreV1().Pods(record.Namespace).Delete(ctx, name, metav1.DeleteOptions{})
-			if err != nil && !apierrors.IsNotFound(err) {
+			if err := r.deletePodByName(ctx, record.Namespace, name); err != nil {
 				return err
 			}
 		}
@@ -104,35 +101,39 @@ func (r *Runner) applyQuiesceRecord(ctx context.Context, record QuiesceRecord) e
 
 func (r *Runner) orphanStatefulSetAndDeletePod(ctx context.Context, pod *corev1.Pod, sts *appsv1.StatefulSet) error {
 	propagation := metav1.DeletePropagationOrphan
-	err := r.client.AppsV1().StatefulSets(sts.Namespace).Delete(ctx, sts.Name, metav1.DeleteOptions{PropagationPolicy: &propagation})
-	if err != nil && !apierrors.IsNotFound(err) {
+	current, err := r.client.AppsV1().StatefulSets(sts.Namespace).Get(ctx, sts.Name, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		current = nil
+	} else if err != nil {
 		return err
+	}
+	if current != nil {
+		err = r.client.AppsV1().StatefulSets(sts.Namespace).Delete(ctx, sts.Name, deleteOptionsForUIDWithPropagation(current.UID, propagation))
+		if err != nil && !apierrors.IsNotFound(err) {
+			return err
+		}
 	}
 	if err := r.waitStatefulSetGone(ctx, sts.Namespace, sts.Name); err != nil {
 		return err
 	}
-	err = r.client.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{})
-	if err != nil && !apierrors.IsNotFound(err) {
-		return err
-	}
-	return nil
+	return r.deletePodByName(ctx, pod.Namespace, pod.Name)
 }
 
 func (r *Runner) excludeDaemonSetNodes(ctx context.Context, ds *appsv1.DaemonSet, nodeNames []string) error {
 	affinity := excludeNodesFromAffinity(ds.Spec.Template.Spec.Affinity, nodeNames)
-	payload := map[string]any{
-		"spec": map[string]any{
-			"updateStrategy": map[string]any{
-				"type":          string(appsv1.OnDeleteDaemonSetStrategyType),
-				"rollingUpdate": nil,
-			},
-			"template": map[string]any{
-				"spec": map[string]any{"affinity": affinity},
-			},
-		},
+	updateStrategy := map[string]any{
+		"type":          string(appsv1.OnDeleteDaemonSetStrategyType),
+		"rollingUpdate": nil,
 	}
-	data, _ := json.Marshal(payload)
-	_, err := r.client.AppsV1().DaemonSets(ds.Namespace).Patch(ctx, ds.Name, types.MergePatchType, data, metav1.PatchOptions{})
+	data, err := jsonPatchWithUIDTest(
+		ds.UID,
+		jsonPatchOperation{Op: "add", Path: "/spec/updateStrategy", Value: updateStrategy},
+		jsonPatchOperation{Op: "add", Path: "/spec/template/spec/affinity", Value: affinity},
+	)
+	if err != nil {
+		return err
+	}
+	_, err = r.client.AppsV1().DaemonSets(ds.Namespace).Patch(ctx, ds.Name, types.JSONPatchType, data, metav1.PatchOptions{})
 	return err
 }
 
@@ -166,23 +167,41 @@ func excludeNodesFromAffinity(in *corev1.Affinity, nodeNames []string) *corev1.A
 }
 
 func (r *Runner) scaleDeployment(ctx context.Context, namespace, name string, replicas int32) error {
-	payload := map[string]any{"spec": map[string]any{"replicas": replicas}}
-	data, _ := json.Marshal(payload)
-	_, err := r.client.AppsV1().Deployments(namespace).Patch(ctx, name, types.MergePatchType, data, metav1.PatchOptions{})
+	deploy, err := r.client.AppsV1().Deployments(namespace).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+	data, err := jsonPatchWithUIDTest(deploy.UID, jsonPatchOperation{Op: "add", Path: "/spec/replicas", Value: replicas})
+	if err != nil {
+		return err
+	}
+	_, err = r.client.AppsV1().Deployments(namespace).Patch(ctx, name, types.JSONPatchType, data, metav1.PatchOptions{})
 	return err
 }
 
 func (r *Runner) scaleReplicaSet(ctx context.Context, namespace, name string, replicas int32) error {
-	payload := map[string]any{"spec": map[string]any{"replicas": replicas}}
-	data, _ := json.Marshal(payload)
-	_, err := r.client.AppsV1().ReplicaSets(namespace).Patch(ctx, name, types.MergePatchType, data, metav1.PatchOptions{})
+	rs, err := r.client.AppsV1().ReplicaSets(namespace).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+	data, err := jsonPatchWithUIDTest(rs.UID, jsonPatchOperation{Op: "add", Path: "/spec/replicas", Value: replicas})
+	if err != nil {
+		return err
+	}
+	_, err = r.client.AppsV1().ReplicaSets(namespace).Patch(ctx, name, types.JSONPatchType, data, metav1.PatchOptions{})
 	return err
 }
 
 func (r *Runner) scaleStatefulSet(ctx context.Context, namespace, name string, replicas int32) error {
-	payload := map[string]any{"spec": map[string]any{"replicas": replicas}}
-	data, _ := json.Marshal(payload)
-	_, err := r.client.AppsV1().StatefulSets(namespace).Patch(ctx, name, types.MergePatchType, data, metav1.PatchOptions{})
+	sts, err := r.client.AppsV1().StatefulSets(namespace).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+	data, err := jsonPatchWithUIDTest(sts.UID, jsonPatchOperation{Op: "add", Path: "/spec/replicas", Value: replicas})
+	if err != nil {
+		return err
+	}
+	_, err = r.client.AppsV1().StatefulSets(namespace).Patch(ctx, name, types.JSONPatchType, data, metav1.PatchOptions{})
 	return err
 }
 
@@ -196,7 +215,7 @@ func (r *Runner) waitStatefulSetGone(ctx context.Context, namespace, name string
 	})
 }
 
-func (r *Runner) waitNoRunningConsumers(ctx context.Context, pvc *corev1.PersistentVolumeClaim) error {
+func (r *Runner) waitNoActiveConsumers(ctx context.Context, pvc *corev1.PersistentVolumeClaim) error {
 	return wait(ctx, 10*time.Minute, func() (bool, error) {
 		consumers, err := r.consumingPods(ctx, pvc)
 		if err != nil {

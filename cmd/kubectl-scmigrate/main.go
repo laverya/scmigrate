@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/laverya/scmigrate/internal/scmigrate"
+	buildversion "github.com/laverya/scmigrate/internal/version"
 )
 
 type annotationFilters []string
@@ -27,27 +28,32 @@ func main() {
 		os.Exit(2)
 	}
 
+	command := os.Args[1]
+	if command == "help" || command == "--help" || command == "-h" {
+		usage()
+		return
+	}
+	if command == "version" {
+		buildversion.Print(os.Stdout)
+		return
+	}
+
 	var annotations annotationFilters
 	fs := flag.NewFlagSet("kubectl-scmigrate", flag.ExitOnError)
-	opts := scmigrate.Options{}
+	opts := scmigrate.Options{RunnerImage: buildversion.DefaultRunnerImage(buildversion.Effective())}
 	fs.StringVar(&opts.Namespace, "namespace", "", "Namespace to scan. Defaults to the current kubeconfig namespace.")
 	fs.BoolVar(&opts.AllNamespaces, "all-namespaces", false, "Scan all namespaces.")
 	fs.StringVar(&opts.Selector, "selector", "", "PVC label selector.")
 	fs.Var(&annotations, "annotation", "PVC annotation filter in key=value form. Repeatable.")
 	fs.StringVar(&opts.SourceStorageClass, "source-storage-class", "", "Only migrate PVCs currently using this storageClass.")
 	fs.StringVar(&opts.TargetStorageClass, "target-storage-class", "", "Destination storageClass.")
-	fs.StringVar(&opts.RunnerImage, "runner-image", "ghcr.io/laverya/scmigrate-rsync:latest", "Image used by rsync pods.")
-	fs.StringVar(&opts.RsyncArgs, "rsync-args", "-aHAX --numeric-ids --delete --info=progress2", "Arguments passed to rsync.")
+	fs.StringVar(&opts.RunnerImage, "runner-image", opts.RunnerImage, "Image used by rsync pods. Required for run unless this binary has a release-version default; use a non-latest tag or digest.")
+	fs.StringVar(&opts.RsyncArgs, "rsync-args", scmigrate.DefaultRsyncArgs, "Whitespace-separated arguments passed to rsync.")
 	fs.BoolVar(&opts.Yes, "yes", false, "Apply changes without prompting.")
 	fs.BoolVar(&opts.DryRun, "dry-run", false, "Show actions without changing the cluster.")
 	fs.BoolVar(&opts.SkipInitialSync, "skip-initial-sync", false, "Skip the live initial rsync phase.")
 	fs.BoolVar(&opts.RestoreReclaimPolicy, "restore-reclaim-policy", false, "Restore the destination PV reclaim policy after cutover.")
 
-	command := os.Args[1]
-	if command == "help" || command == "--help" || command == "-h" {
-		usage()
-		return
-	}
 	if err := fs.Parse(os.Args[2:]); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
@@ -82,6 +88,7 @@ func usage() {
 Usage:
   kubectl scmigrate plan --target-storage-class fast [flags]
   kubectl scmigrate run  --target-storage-class fast --yes [flags]
+  kubectl scmigrate version
 
 Selection flags:
   --namespace ns                  Scan one namespace
@@ -92,5 +99,9 @@ Selection flags:
 
 Safety flags:
   --dry-run                       Print changes only
+
+Runner flags:
+  --runner-image image:tag        Required for run unless release default is available; latest is rejected
+  --rsync-args args               Whitespace-separated rsync arguments
 `)
 }

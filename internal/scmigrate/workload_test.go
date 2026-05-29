@@ -12,6 +12,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
 )
@@ -149,6 +150,29 @@ func TestQuiesceSharedDeploymentPVCScalesDeploymentToZeroOnce(t *testing.T) {
 	}
 	if got.Spec.Replicas == nil || *got.Spec.Replicas != 0 {
 		t.Fatalf("deployment replicas = %v, want 0", got.Spec.Replicas)
+	}
+}
+
+func TestConsumingPodsIncludesPendingAndSkipsTerminalPods(t *testing.T) {
+	ctx := testContext(t)
+	pvc := testPVC("default", "data")
+	pending := testPod("default", "pending", "data", "", metav1.OwnerReference{})
+	pending.Status.Phase = corev1.PodPending
+	unknown := testPod("default", "unknown", "data", "node-a", metav1.OwnerReference{})
+	unknown.Status.Phase = corev1.PodUnknown
+	succeeded := testPod("default", "succeeded", "data", "node-a", metav1.OwnerReference{})
+	succeeded.Status.Phase = corev1.PodSucceeded
+	failed := testPod("default", "failed", "data", "node-a", metav1.OwnerReference{})
+	failed.Status.Phase = corev1.PodFailed
+	other := testPod("default", "other", "other", "node-a", metav1.OwnerReference{})
+	runner := &Runner{client: fake.NewSimpleClientset(pending, unknown, succeeded, failed, other), out: io.Discard}
+
+	consumers, err := runner.consumingPods(ctx, pvc)
+	if err != nil {
+		t.Fatalf("consumingPods returned error: %v", err)
+	}
+	if got, want := podNames(consumers), []string{"pending", "unknown"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("consumers = %#v, want %#v", got, want)
 	}
 }
 
@@ -834,6 +858,7 @@ func testPod(namespace, name, claimName, nodeName string, owner metav1.OwnerRefe
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            name,
 			Namespace:       namespace,
+			UID:             types.UID(name + "-uid"),
 			OwnerReferences: []metav1.OwnerReference{owner},
 		},
 		Spec: corev1.PodSpec{

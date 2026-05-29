@@ -14,15 +14,16 @@ last durable point.
 Build the kubectl plugin:
 
 ```sh
-go build -o kubectl-scmigrate ./cmd/kubectl-scmigrate
-install -m 0755 kubectl-scmigrate ~/.local/bin/kubectl-scmigrate
+make build VERSION=v0.1.0
+install -m 0755 bin/kubectl-scmigrate ~/.local/bin/kubectl-scmigrate
 ```
 
 Build and push the rsync worker image:
 
 ```sh
-docker build -f Dockerfile.rsync -t ghcr.io/laverya/scmigrate-rsync:latest .
-docker push ghcr.io/laverya/scmigrate-rsync:latest
+RUNNER_IMAGE=ghcr.io/laverya/scmigrate-rsync:v0.1.0
+docker build -f Dockerfile.rsync -t "$RUNNER_IMAGE" .
+docker push "$RUNNER_IMAGE"
 ```
 
 Apply RBAC for an in-cluster runner, or grant equivalent rights to the user that
@@ -54,9 +55,13 @@ kubectl scmigrate run \
   --namespace default \
   --selector app=postgres \
   --target-storage-class new-sc \
-  --runner-image ghcr.io/laverya/scmigrate-rsync:latest \
   --yes
 ```
+
+Release-versioned plugin builds default `--runner-image` to the matching rsync
+image tag, for example `ghcr.io/laverya/scmigrate-rsync:v0.1.0`. Dev builds do
+not guess; pass `--runner-image` explicitly when `kubectl scmigrate version`
+does not show a default runner image.
 
 PVCs can be selected by namespace, label selector, source storage class, and
 repeatable annotation filters:
@@ -77,8 +82,9 @@ For each matching bound PVC, the plugin:
 2. Creates a temporary destination PVC using the target storage class.
 3. Starts an rsync pod mounting the source read-only and the destination
    read-write while the workload remains online.
-4. Quiesces every running pod that is using that PVC by grouping consumers by
-   their owning workload and scaling/deleting each affected parent once.
+4. Quiesces every active non-terminal pod that is using that PVC by grouping
+   consumers by their owning workload and scaling/deleting each affected parent
+   once.
 5. Runs a final rsync pass.
 6. Sets both the source PV and destination PV reclaim policies to `Retain`.
 7. Deletes the original and temporary PVCs.
@@ -99,8 +105,9 @@ the same place as the source consumer.
 ## Avoiding Full Service Outages
 
 Final sync requires the PVC to have no active writers. `scmigrate` determines
-all running pods that mount each selected PVC, resolves their owning workload,
-and quiesces every affected workload before the final sync and cutover.
+all non-terminal pods that mount each selected PVC, resolves their owning
+workload, and quiesces every affected workload before the final sync and
+cutover. It also rechecks for active consumers immediately before cutover.
 
 For `Deployment` and standalone `ReplicaSet` workloads, the plugin scales each
 affected parent to zero once per PVC and restores the original replica count
@@ -164,6 +171,9 @@ state.
   Namespaces with restricted Pod Security Admission must allow the migration
   worker pod or run it under a policy that permits the required filesystem
   operations.
+- `run` requires an explicit `--runner-image` with a non-`latest` tag or digest.
+  For release-versioned plugin builds, this defaults to the matching
+  `ghcr.io/laverya/scmigrate-rsync:<version>` tag.
 - The default rsync arguments are:
 
 ```text
@@ -172,6 +182,8 @@ state.
 
 - If the source or target filesystem does not support ACLs or extended
   attributes, override `--rsync-args` to remove `-A` and/or `-X`.
+- `--rsync-args` is split on whitespace and passed directly to `rsync`; it is
+  not evaluated by a shell.
 - The plugin leaves PV reclaim policies as `Retain` by default. Pass
   `--restore-reclaim-policy` to restore the destination PV's original policy
   after cutover.

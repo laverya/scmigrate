@@ -51,7 +51,7 @@ func (r *Runner) quiesce(ctx context.Context, pvc *corev1.PersistentVolumeClaim)
 	if r.opts.DryRun {
 		return nil
 	}
-	return r.waitNoRunningConsumers(ctx, pvc)
+	return r.waitNoActiveConsumers(ctx, pvc)
 }
 
 func (r *Runner) quiesceConsumerGroups(ctx context.Context, pvc *corev1.PersistentVolumeClaim, consumers []PVCConsumer) ([]QuiesceRecord, error) {

@@ -32,11 +32,8 @@ func NewRunner(opts Options, out io.Writer) (*Runner, error) {
 	if opts.Namespace == "" && !opts.AllNamespaces {
 		opts.Namespace = currentNamespace
 	}
-	if opts.RunnerImage == "" {
-		opts.RunnerImage = "ghcr.io/laverya/scmigrate-rsync:latest"
-	}
 	if opts.RsyncArgs == "" {
-		opts.RsyncArgs = "-aHAX --numeric-ids --delete --info=progress2"
+		opts.RsyncArgs = DefaultRsyncArgs
 	}
 	return &Runner{opts: opts, client: client, out: out}, nil
 }
@@ -77,6 +74,11 @@ func (r *Runner) Plan(ctx context.Context) error {
 }
 
 func (r *Runner) Run(ctx context.Context) error {
+	if !r.opts.DryRun {
+		if err := validateRunnerImage(r.opts.RunnerImage); err != nil {
+			return err
+		}
+	}
 	migrations, err := r.discover(ctx)
 	if err != nil {
 		return err

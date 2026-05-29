@@ -34,6 +34,9 @@ func (r *Runner) cutover(ctx context.Context, source *corev1.PersistentVolumeCla
 			return err
 		}
 	}
+	if err := r.ensureNoActiveConsumers(ctx, source); err != nil {
+		return err
+	}
 	sourcePV, err := r.client.CoreV1().PersistentVolumes().Get(ctx, source.Spec.VolumeName, metav1.GetOptions{})
 	if err != nil {
 		return err
@@ -65,10 +68,10 @@ func (r *Runner) cutover(ctx context.Context, source *corev1.PersistentVolumeCla
 		fmt.Fprintf(r.out, "dry-run: delete pvc/%s and pvc/%s, clear pv/%s claimRef, create final pvc/%s bound to pv/%s\n", source.Name, dest.Name, dest.Spec.VolumeName, source.Name, dest.Spec.VolumeName)
 		return nil
 	}
-	if err := r.client.CoreV1().PersistentVolumeClaims(source.Namespace).Delete(ctx, source.Name, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+	if err := r.client.CoreV1().PersistentVolumeClaims(source.Namespace).Delete(ctx, source.Name, deleteOptionsForUID(source.UID)); err != nil && !apierrors.IsNotFound(err) {
 		return err
 	}
-	if err := r.client.CoreV1().PersistentVolumeClaims(dest.Namespace).Delete(ctx, dest.Name, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+	if err := r.client.CoreV1().PersistentVolumeClaims(dest.Namespace).Delete(ctx, dest.Name, deleteOptionsForUID(dest.UID)); err != nil && !apierrors.IsNotFound(err) {
 		return err
 	}
 	if err := r.waitPVCGone(ctx, source.Namespace, source.Name); err != nil {
@@ -135,7 +138,7 @@ func (r *Runner) resumeCutoverWithoutSource(ctx context.Context, namespace, name
 	if err := r.persistCutoverRecord(ctx, syntheticSource, dest, destPV); err != nil {
 		return err
 	}
-	if err := r.client.CoreV1().PersistentVolumeClaims(namespace).Delete(ctx, dest.Name, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+	if err := r.client.CoreV1().PersistentVolumeClaims(namespace).Delete(ctx, dest.Name, deleteOptionsForUID(dest.UID)); err != nil && !apierrors.IsNotFound(err) {
 		return err
 	}
 	if err := r.waitPVCGone(ctx, namespace, dest.Name); err != nil {
@@ -165,12 +168,12 @@ func (r *Runner) persistCutoverRecord(ctx context.Context, source, dest *corev1.
 	} else if quiesce := dest.Annotations[AnnQuiesce]; quiesce != "" {
 		annotations[AnnQuiesce] = quiesce
 	}
-	payload := map[string]any{"metadata": map[string]any{"annotations": annotations}}
-	data, _ := json.Marshal(payload)
 	if r.opts.DryRun {
 		fmt.Fprintf(r.out, "dry-run: persist cutover record on pv/%s\n", destPV.Name)
 		return nil
 	}
+	payload := map[string]any{"metadata": map[string]any{"annotations": annotations}}
+	data, _ := json.Marshal(payload)
 	_, err := r.client.CoreV1().PersistentVolumes().Patch(ctx, destPV.Name, types.MergePatchType, data, metav1.PatchOptions{})
 	return err
 }
@@ -240,21 +243,20 @@ func (r *Runner) retainPV(ctx context.Context, pv *corev1.PersistentVolume, orig
 		originalPolicyAnnotation: string(pv.Spec.PersistentVolumeReclaimPolicy),
 		AnnState:                 StateFinalSynced,
 	}
+	if r.opts.DryRun {
+		fmt.Fprintf(r.out, "dry-run: set pv/%s reclaimPolicy=Retain\n", pv.Name)
+		return nil
+	}
 	payload := map[string]any{
 		"metadata": map[string]any{"annotations": annotations},
 		"spec":     map[string]any{"persistentVolumeReclaimPolicy": string(corev1.PersistentVolumeReclaimRetain)},
 	}
 	data, _ := json.Marshal(payload)
-	if r.opts.DryRun {
-		fmt.Fprintf(r.out, "dry-run: set pv/%s reclaimPolicy=Retain\n", pv.Name)
-		return nil
-	}
 	_, err := r.client.CoreV1().PersistentVolumes().Patch(ctx, pv.Name, types.MergePatchType, data, metav1.PatchOptions{})
 	return err
 }
 
 func (r *Runner) clearPVClaimRef(ctx context.Context, pvName string) error {
-	patch := []byte(`[{"op":"remove","path":"/spec/claimRef"}]`)
 	if r.opts.DryRun {
 		fmt.Fprintf(r.out, "dry-run: clear pv/%s claimRef\n", pvName)
 		return nil
@@ -265,6 +267,18 @@ func (r *Runner) clearPVClaimRef(ctx context.Context, pvName string) error {
 	}
 	if pv.Spec.ClaimRef == nil {
 		return nil
+	}
+	ops := []jsonPatchOperation{
+		{Op: "test", Path: "/spec/claimRef/namespace", Value: pv.Spec.ClaimRef.Namespace},
+		{Op: "test", Path: "/spec/claimRef/name", Value: pv.Spec.ClaimRef.Name},
+	}
+	if pv.Spec.ClaimRef.UID != "" {
+		ops = append(ops, jsonPatchOperation{Op: "test", Path: "/spec/claimRef/uid", Value: string(pv.Spec.ClaimRef.UID)})
+	}
+	ops = append(ops, jsonPatchOperation{Op: "remove", Path: "/spec/claimRef"})
+	patch, err := jsonPatchWithUIDTest(pv.UID, ops...)
+	if err != nil {
+		return err
 	}
 	_, err = r.client.CoreV1().PersistentVolumes().Patch(ctx, pvName, types.JSONPatchType, patch, metav1.PatchOptions{})
 	if apierrors.IsInvalid(err) || apierrors.IsNotFound(err) {

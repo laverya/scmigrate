@@ -8,6 +8,11 @@ builds:
     binary: kubectl-scmigrate
     env:
       - CGO_ENABLED=0
+    ldflags:
+      - "-s -w"
+      - "-X github.com/laverya/scmigrate/internal/version.Version={{ .Tag }}"
+      - "-X github.com/laverya/scmigrate/internal/version.Commit={{ .Commit }}"
+      - "-X github.com/laverya/scmigrate/internal/version.Date={{ .Date }}"
     goos:
       - linux
       - darwin
