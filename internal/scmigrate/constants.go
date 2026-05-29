@@ -22,10 +22,23 @@ const (
 
 	ConfigMapKeyStatefulSet = "statefulset.json"
 
+	ManagedByValue = "scmigrate"
+
+	StateNew           = "new"
 	StatePrepared      = "prepared"
 	StateInitialSynced = "initial-synced"
 	StateQuiesced      = "quiesced"
 	StateFinalSynced   = "final-synced"
 	StateCutover       = "cutover"
 	StateRestored      = "restored"
+
+	SyncPhaseInitial = "initial"
+	SyncPhaseFinal   = "final"
+
+	WorkloadKindNone        = "None"
+	WorkloadKindPod         = "Pod"
+	WorkloadKindDeployment  = "Deployment"
+	WorkloadKindReplicaSet  = "ReplicaSet"
+	WorkloadKindStatefulSet = "StatefulSet"
+	WorkloadKindDaemonSet   = "DaemonSet"
 )

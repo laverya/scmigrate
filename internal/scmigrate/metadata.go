@@ -110,16 +110,6 @@ func shortHash(value string) string {
 	return fmt.Sprintf("%08x", h.Sum32())
 }
 
-func mergeAnnotations(dst map[string]string, pairs map[string]string) map[string]string {
-	if dst == nil {
-		dst = map[string]string{}
-	}
-	for k, v := range pairs {
-		dst[k] = v
-	}
-	return dst
-}
-
 func sortedKeys(in map[string]string) []string {
 	keys := make([]string, 0, len(in))
 	for key := range in {

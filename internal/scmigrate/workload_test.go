@@ -22,7 +22,7 @@ func testContext(t *testing.T) context.Context {
 }
 
 func TestExcludeNodeFromAffinityCreatesRequiredMatchField(t *testing.T) {
-	affinity := excludeNodeFromAffinity(nil, "node-a")
+	affinity := excludeNodesFromAffinity(nil, []string{"node-a"})
 
 	terms := affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms
 	if len(terms) != 1 {
@@ -63,7 +63,7 @@ func TestExcludeNodeFromAffinityPreservesOrTerms(t *testing.T) {
 		},
 	}
 
-	affinity := excludeNodeFromAffinity(in, "node-b")
+	affinity := excludeNodesFromAffinity(in, []string{"node-b"})
 	terms := affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms
 	if len(terms) != 2 {
 		t.Fatalf("expected two selector terms, got %d", len(terms))
@@ -200,7 +200,7 @@ func TestQuiescePVCSharedByMultipleParentsScalesEveryParent(t *testing.T) {
 	}
 }
 
-func TestQuiesceConvenienceMethodsUseClusterWorkloadState(t *testing.T) {
+func TestQuiesceConsumerGroupsUseClusterWorkloadState(t *testing.T) {
 	ctx := testContext(t)
 	pvc := testPVC("default", "data")
 	standalone := testPod("default", "standalone", "data", "node-a", metav1.OwnerReference{})
@@ -217,27 +217,39 @@ func TestQuiesceConvenienceMethodsUseClusterWorkloadState(t *testing.T) {
 	)
 	runner := &Runner{client: client, out: io.Discard}
 
-	record, err := runner.quiescePod(ctx, pvc, standalone)
+	ref, err := runner.workloadRefForPod(ctx, standalone)
 	if err != nil {
-		t.Fatalf("quiescePod returned error: %v", err)
+		t.Fatalf("workloadRefForPod returned error: %v", err)
 	}
+	records, err := runner.quiesceConsumerGroups(ctx, pvc, []PVCConsumer{{Pod: *standalone, Workload: ref}})
+	if err != nil {
+		t.Fatalf("quiesceConsumerGroups returned error: %v", err)
+	}
+	record := records[0]
 	if record.Kind != "Pod" || record.PodName != "standalone" {
 		t.Fatalf("unexpected pod record: %#v", record)
 	}
-	record, err = runner.quiesceDeployment(ctx, pvc, deployPod, "app")
+	ref, err = runner.workloadRefForPod(ctx, deployPod)
 	if err != nil {
-		t.Fatalf("quiesceDeployment returned error: %v", err)
+		t.Fatalf("deployment workloadRefForPod returned error: %v", err)
 	}
+	records, err = runner.quiesceConsumerGroups(ctx, pvc, []PVCConsumer{{Pod: *deployPod, Workload: ref}})
+	if err != nil {
+		t.Fatalf("deployment quiesceConsumerGroups returned error: %v", err)
+	}
+	record = records[0]
 	if record.Kind != "Deployment" || record.OriginalReplicas != 2 {
 		t.Fatalf("unexpected deployment record: %#v", record)
 	}
-	record, err = runner.quiesceReplicaSet(ctx, rsPod, &appsv1.ReplicaSet{
-		ObjectMeta: metav1.ObjectMeta{Name: "worker-rs", Namespace: "default"},
-		Spec:       appsv1.ReplicaSetSpec{Replicas: int32Ptr(1)},
-	})
+	ref, err = runner.workloadRefForPod(ctx, rsPod)
 	if err != nil {
-		t.Fatalf("quiesceReplicaSet returned error: %v", err)
+		t.Fatalf("replicaset workloadRefForPod returned error: %v", err)
 	}
+	records, err = runner.quiesceConsumerGroups(ctx, pvc, []PVCConsumer{{Pod: *rsPod, Workload: ref}})
+	if err != nil {
+		t.Fatalf("replicaset quiesceConsumerGroups returned error: %v", err)
+	}
+	record = records[0]
 	if record.Kind != "ReplicaSet" || record.OriginalReplicas != 1 {
 		t.Fatalf("unexpected replicaset record: %#v", record)
 	}
@@ -326,7 +338,7 @@ func TestQuiesceDaemonSetDryRunRecordsOriginalScheduling(t *testing.T) {
 		Spec:       corev1.PodSpec{NodeName: "node-a"},
 	}
 
-	record, err := runner.quiesceDaemonSet(testContext(t), pod, ds)
+	record, err := runner.quiesceDaemonSetObject(testContext(t), WorkloadRef{Kind: WorkloadKindDaemonSet, Namespace: pod.Namespace, Name: ds.Name}, []corev1.Pod{*pod}, ds)
 	if err != nil {
 		t.Fatalf("quiesceDaemonSet returned error: %v", err)
 	}
@@ -653,7 +665,7 @@ func TestRestoreQuiesceRecordRestoresControllerState(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "agent", Namespace: "default"},
 		Spec: appsv1.DaemonSetSpec{
 			UpdateStrategy: appsv1.DaemonSetUpdateStrategy{Type: appsv1.OnDeleteDaemonSetStrategyType},
-			Template:       corev1.PodTemplateSpec{Spec: corev1.PodSpec{Affinity: excludeNodeFromAffinity(originalAffinity, "node-a")}},
+			Template:       corev1.PodTemplateSpec{Spec: corev1.PodSpec{Affinity: excludeNodesFromAffinity(originalAffinity, []string{"node-a"})}},
 		},
 	}
 	client := fake.NewSimpleClientset(rs, sts, ds)
@@ -743,8 +755,8 @@ func TestStoreQuiesceRecordPatchesSourcePVC(t *testing.T) {
 	pvc := boundPVC("default", "data", "source-pv", "old-sc")
 	runner := &Runner{client: fake.NewSimpleClientset(pvc), out: io.Discard}
 
-	if err := runner.storeQuiesceRecord(ctx, pvc, QuiesceRecord{Kind: "None", Namespace: "default"}); err != nil {
-		t.Fatalf("storeQuiesceRecord returned error: %v", err)
+	if err := runner.storeQuiesceRecords(ctx, pvc, []QuiesceRecord{{Kind: "None", Namespace: "default"}}); err != nil {
+		t.Fatalf("storeQuiesceRecords returned error: %v", err)
 	}
 	updated, err := runner.client.CoreV1().PersistentVolumeClaims("default").Get(ctx, "data", metav1.GetOptions{})
 	if err != nil {

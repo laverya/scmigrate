@@ -28,16 +28,41 @@ func TestAffinityForNodePinsWithMatchField(t *testing.T) {
 }
 
 func TestStateBeforeOrdersResumablePhases(t *testing.T) {
-	if !stateBefore("", StatePrepared) {
+	before, err := stateBefore("", StatePrepared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !before {
 		t.Fatal("empty state should be before prepared")
 	}
-	if !stateBefore(StateInitialSynced, StateFinalSynced) {
+	before, err = stateBefore(StateInitialSynced, StateFinalSynced)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !before {
 		t.Fatal("initial sync should be before final sync")
 	}
-	if stateBefore(StateRestored, StateCutover) {
+	before, err = stateBefore(StateRestored, StateCutover)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before {
 		t.Fatal("restored state should not be before cutover")
 	}
-	if stateBefore(StateFinalSynced, StateInitialSynced) {
+	before, err = stateBefore(StateFinalSynced, StateInitialSynced)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before {
 		t.Fatal("final sync should not be before initial sync")
+	}
+}
+
+func TestStateBeforeRejectsUnknownState(t *testing.T) {
+	if _, err := stateBefore("mystery", StatePrepared); err == nil {
+		t.Fatal("stateBefore should reject unknown current states")
+	}
+	if _, err := stateBefore(StatePrepared, "mystery"); err == nil {
+		t.Fatal("stateBefore should reject unknown target states")
 	}
 }

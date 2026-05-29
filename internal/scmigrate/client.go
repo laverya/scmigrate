@@ -2,8 +2,6 @@ package scmigrate
 
 import (
 	"fmt"
-	"os"
-	"path/filepath"
 
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -33,12 +31,4 @@ func kubernetesClient() (*kubernetes.Clientset, string, error) {
 		return nil, "", err
 	}
 	return client, namespace, nil
-}
-
-func defaultKubeconfigPath() string {
-	if path := os.Getenv("KUBECONFIG"); path != "" {
-		return path
-	}
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".kube", "config")
 }
