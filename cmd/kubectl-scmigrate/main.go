@@ -7,8 +7,8 @@ import (
 	"os"
 	"strings"
 
-	"github.com/laverya/scmigrate/internal/scmigrate"
-	buildversion "github.com/laverya/scmigrate/internal/version"
+	"github.com/laverya/scmigrate/pkg/scmigrate"
+	buildversion "github.com/laverya/scmigrate/pkg/version"
 )
 
 type annotationFilters []string

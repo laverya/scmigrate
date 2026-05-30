@@ -10,7 +10,7 @@ and what needs stronger documentation.
 
 Status: Resolved.
 
-`internal/scmigrate/runner.go` deletes the source PVC and the temporary
+`pkg/scmigrate/runner.go` deletes the source PVC and the temporary
 destination PVC before creating the final PVC:
 
 - `cutover` deletes the source PVC.

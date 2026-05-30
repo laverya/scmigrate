@@ -6,10 +6,10 @@ migration code, plus the order to address them.
 ## Readability Findings
 
 The main migration story is understandable from the README, but harder to audit
-in code than it needs to be. `internal/scmigrate/runner.go` contains public
+in code than it needs to be. `pkg/scmigrate/runner.go` contains public
 entry points, migration orchestration, discovery, dry-run projection, sync pod
 construction, cutover, resume logic, Kubernetes patch helpers, wait helpers, and
-pod-to-workload lookup. `internal/scmigrate/workload.go` contains workload
+pod-to-workload lookup. `pkg/scmigrate/workload.go` contains workload
 quiesce planning, mutation, restore, and assorted helpers.
 
 The top-level order in `runner.go` starts well: `NewRunner`, `Plan`, `Run`, and

@@ -4,7 +4,7 @@ BIN ?= $(CURDIR)/bin/kubectl-scmigrate
 VERSION ?= dev
 COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || printf unknown)
 DATE ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
-LDFLAGS ?= -X github.com/laverya/scmigrate/internal/version.Version=$(VERSION) -X github.com/laverya/scmigrate/internal/version.Commit=$(COMMIT) -X github.com/laverya/scmigrate/internal/version.Date=$(DATE)
+LDFLAGS ?= -X github.com/laverya/scmigrate/pkg/version.Version=$(VERSION) -X github.com/laverya/scmigrate/pkg/version.Commit=$(COMMIT) -X github.com/laverya/scmigrate/pkg/version.Date=$(DATE)
 
 .PHONY: build test e2e
 
