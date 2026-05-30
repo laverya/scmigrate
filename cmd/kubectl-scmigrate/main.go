@@ -7,6 +7,10 @@ import (
 	"os"
 	"strings"
 
+	_ "github.com/rclone/rclone/backend/local"
+	rclonecmd "github.com/rclone/rclone/cmd"
+	_ "github.com/rclone/rclone/cmd/sync"
+
 	"github.com/laverya/scmigrate/pkg/scmigrate"
 	buildversion "github.com/laverya/scmigrate/pkg/version"
 )
@@ -37,6 +41,10 @@ func main() {
 		buildversion.Print(os.Stdout)
 		return
 	}
+	if command == "rclone" {
+		runRclone(os.Args[2:])
+		return
+	}
 
 	var annotations annotationFilters
 	fs := flag.NewFlagSet("kubectl-scmigrate", flag.ExitOnError)
@@ -47,11 +55,11 @@ func main() {
 	fs.Var(&annotations, "annotation", "PVC annotation filter in key=value form. Repeatable.")
 	fs.StringVar(&opts.SourceStorageClass, "source-storage-class", "", "Only migrate PVCs currently using this storageClass.")
 	fs.StringVar(&opts.TargetStorageClass, "target-storage-class", "", "Destination storageClass.")
-	fs.StringVar(&opts.RunnerImage, "runner-image", opts.RunnerImage, "Image used by rsync pods. Required for run unless this binary has a release-version default; use a non-latest tag or digest.")
-	fs.StringVar(&opts.RsyncArgs, "rsync-args", scmigrate.DefaultRsyncArgs, "Whitespace-separated arguments passed to rsync.")
+	fs.StringVar(&opts.RunnerImage, "runner-image", opts.RunnerImage, "Image used by sync pods. Required for run unless this binary has a release-version default; use a non-latest tag or digest.")
+	fs.StringVar(&opts.RcloneArgs, "rclone-args", scmigrate.DefaultRcloneArgs, "Whitespace-separated arguments passed after rclone sync.")
 	fs.BoolVar(&opts.Yes, "yes", false, "Apply changes without prompting.")
 	fs.BoolVar(&opts.DryRun, "dry-run", false, "Show actions without changing the cluster.")
-	fs.BoolVar(&opts.SkipInitialSync, "skip-initial-sync", false, "Skip the live initial rsync phase.")
+	fs.BoolVar(&opts.SkipInitialSync, "skip-initial-sync", false, "Skip the live initial sync phase.")
 	fs.BoolVar(&opts.RestoreReclaimPolicy, "restore-reclaim-policy", false, "Restore the destination PV reclaim policy after cutover.")
 
 	if err := fs.Parse(os.Args[2:]); err != nil {
@@ -89,6 +97,7 @@ Usage:
   kubectl scmigrate plan --target-storage-class fast [flags]
   kubectl scmigrate run  --target-storage-class fast --yes [flags]
   kubectl scmigrate version
+  kubectl scmigrate rclone [rclone command] [flags]
 
 Selection flags:
   --namespace ns                  Scan one namespace
@@ -102,6 +111,14 @@ Safety flags:
 
 Runner flags:
   --runner-image image:tag        Required for run unless release default is available; latest is rejected
-  --rsync-args args               Whitespace-separated rsync arguments
+  --rclone-args args              Whitespace-separated arguments passed after rclone sync
 `)
+}
+
+func runRclone(args []string) {
+	oldArgs := os.Args
+	os.Args = append([]string{"rclone"}, args...)
+	defer func() { os.Args = oldArgs }()
+
+	rclonecmd.Main()
 }

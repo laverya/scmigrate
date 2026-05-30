@@ -1,0 +1,4 @@
+FROM scratch
+ARG TARGETPLATFORM
+COPY ${TARGETPLATFORM}/kubectl-scmigrate /kubectl-scmigrate
+ENTRYPOINT ["/kubectl-scmigrate", "rclone"]

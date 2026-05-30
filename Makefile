@@ -1,4 +1,5 @@
 GO ?= $(shell command -v go 2>/dev/null || printf /usr/local/go/bin/go)
+CGO_ENABLED ?= 0
 GOCACHE ?= /tmp/scmigrate-go-cache
 BIN ?= $(CURDIR)/bin/kubectl-scmigrate
 VERSION ?= dev
@@ -10,7 +11,7 @@ LDFLAGS ?= -X github.com/laverya/scmigrate/pkg/version.Version=$(VERSION) -X git
 
 build:
 	mkdir -p $(dir $(BIN))
-	GOCACHE=$(GOCACHE) $(GO) build -ldflags "$(LDFLAGS)" -o $(BIN) ./cmd/kubectl-scmigrate
+	CGO_ENABLED=$(CGO_ENABLED) GOCACHE=$(GOCACHE) $(GO) build -ldflags "$(LDFLAGS)" -o $(BIN) ./cmd/kubectl-scmigrate
 
 test:
 	GOCACHE=$(GOCACHE) $(GO) test ./...

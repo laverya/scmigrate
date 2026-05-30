@@ -119,7 +119,7 @@ func (r *Runner) runSync(ctx context.Context, source *corev1.PersistentVolumeCla
 		return err
 	}
 
-	command, args, err := rsyncCommand(r.opts.RsyncArgs)
+	command, args, err := rcloneCommand(r.opts.RcloneArgs)
 	if err != nil {
 		return err
 	}
@@ -150,7 +150,7 @@ func (r *Runner) runSync(ctx context.Context, source *corev1.PersistentVolumeCla
 		Spec: corev1.PodSpec{
 			RestartPolicy: corev1.RestartPolicyNever,
 			Containers: []corev1.Container{{
-				Name:            "rsync",
+				Name:            "rclone",
 				Image:           r.opts.RunnerImage,
 				ImagePullPolicy: corev1.PullIfNotPresent,
 				Command:         command,
@@ -226,13 +226,10 @@ func affinityForNode(nodeName string) *corev1.Affinity {
 	}
 }
 
-func rsyncCommand(rawArgs string) ([]string, []string, error) {
-	args := strings.Fields(rawArgs)
-	if len(args) == 0 {
-		return nil, nil, fmt.Errorf("rsync args are empty")
-	}
-	args = append(args, "/source/", "/destination/")
-	return []string{"rsync"}, args, nil
+func rcloneCommand(rawArgs string) ([]string, []string, error) {
+	args := append([]string{"sync"}, strings.Fields(rawArgs)...)
+	args = append(args, "/source", "/destination")
+	return []string{"/kubectl-scmigrate", "rclone"}, args, nil
 }
 
 func validateRunnerImage(image string) error {

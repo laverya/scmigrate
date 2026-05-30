@@ -14,7 +14,7 @@ type Options struct {
 	SourceStorageClass   string
 	TargetStorageClass   string
 	RunnerImage          string
-	RsyncArgs            string
+	RcloneArgs           string
 	Yes                  bool
 	DryRun               bool
 	SkipInitialSync      bool

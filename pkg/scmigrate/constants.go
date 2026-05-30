@@ -24,7 +24,7 @@ const (
 
 	ManagedByValue = "scmigrate"
 
-	DefaultRsyncArgs = "-aHAX --numeric-ids --delete --info=progress2"
+	DefaultRcloneArgs = "--config=/dev/null --links --metadata --create-empty-src-dirs --stats=15s"
 
 	StateNew           = "new"
 	StatePrepared      = "prepared"

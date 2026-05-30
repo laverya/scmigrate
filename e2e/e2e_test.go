@@ -32,6 +32,7 @@ type e2eCluster struct {
 	name        string
 	kubeconfig  string
 	runnerImage string
+	appImage    string
 	etcdImage   string
 	bin         string
 }
@@ -83,7 +84,7 @@ func TestMigrations(t *testing.T) {
 				_ = cluster.kubectl(cleanupCtx, "delete", "namespace", namespace, "--ignore-not-found=true")
 			})
 
-			applyYAML(t, ctx, cluster, tc.manifest(namespace, runID, cluster.runnerImage))
+			applyYAML(t, ctx, cluster, tc.manifest(namespace, runID, cluster.appImage))
 			kubectlOK(t, ctx, cluster, "rollout", "status", "-n", namespace, tc.rolloutRef, "--timeout=180s")
 
 			pod := podName(t, ctx, cluster, namespace, tc.podLabel)
@@ -117,7 +118,7 @@ func TestSharedPVCDeploymentReplicas(t *testing.T) {
 		_ = cluster.kubectl(cleanupCtx, "delete", "namespace", namespace, "--ignore-not-found=true")
 	})
 
-	applyYAML(t, ctx, cluster, sharedDeploymentYAML(namespace, runID, cluster.runnerImage))
+	applyYAML(t, ctx, cluster, sharedDeploymentYAML(namespace, runID, cluster.appImage))
 	kubectlOK(t, ctx, cluster, "rollout", "status", "-n", namespace, "deployment/app", "--timeout=240s")
 	assertReadyReplicas(t, ctx, cluster, namespace, "app", 3)
 
@@ -150,7 +151,7 @@ func TestSharedPVCMultipleDeployments(t *testing.T) {
 		_ = cluster.kubectl(cleanupCtx, "delete", "namespace", namespace, "--ignore-not-found=true")
 	})
 
-	applyYAML(t, ctx, cluster, sharedMultipleDeploymentsYAML(namespace, runID, cluster.runnerImage))
+	applyYAML(t, ctx, cluster, sharedMultipleDeploymentsYAML(namespace, runID, cluster.appImage))
 	kubectlOK(t, ctx, cluster, "rollout", "status", "-n", namespace, "deployment/api", "--timeout=240s")
 	kubectlOK(t, ctx, cluster, "rollout", "status", "-n", namespace, "deployment/worker", "--timeout=240s")
 
@@ -187,7 +188,7 @@ func TestThreeReplicaStatefulSetEmptyPVCs(t *testing.T) {
 		_ = cluster.kubectl(cleanupCtx, "delete", "namespace", namespace, "--ignore-not-found=true")
 	})
 
-	applyYAML(t, ctx, cluster, threeReplicaStatefulSetYAML(namespace, runID, cluster.runnerImage))
+	applyYAML(t, ctx, cluster, threeReplicaStatefulSetYAML(namespace, runID, cluster.appImage))
 	kubectlOK(t, ctx, cluster, "rollout", "status", "-n", namespace, "statefulset/app", "--timeout=240s")
 
 	runScmigrate(t, ctx, cluster, namespace, "statefulset-empty", runID, cluster.runnerImage)
@@ -312,6 +313,7 @@ func startE2ECluster(t *testing.T, timeout time.Duration) (*e2eCluster, context.
 	cluster := &e2eCluster{
 		name:        clusterName(t),
 		runnerImage: requireEnv(t, "SCMIGRATE_RUNNER_IMAGE"),
+		appImage:    requireEnv(t, "SCMIGRATE_E2E_APP_IMAGE"),
 		etcdImage:   requireEnv(t, "ETCD_IMAGE"),
 		bin:         requireEnv(t, "SCMIGRATE_BIN"),
 	}
@@ -320,6 +322,7 @@ func startE2ECluster(t *testing.T, timeout time.Duration) (*e2eCluster, context.
 	defer setupCancel()
 	runCommand(t, setupCtx, "", "kind", []string{"create", "cluster", "--name", cluster.name, "--wait", "120s"})
 	runCommand(t, setupCtx, "", "kind", []string{"load", "docker-image", cluster.runnerImage, "--name", cluster.name})
+	runCommand(t, setupCtx, "", "kind", []string{"load", "docker-image", cluster.appImage, "--name", cluster.name})
 
 	cluster.kubeconfig = filepath.Join(t.TempDir(), "kubeconfig")
 	kubeconfig := runCommand(t, setupCtx, "", "kind", []string{"get", "kubeconfig", "--name", cluster.name})
@@ -404,7 +407,7 @@ func runScmigrateCommand(ctx context.Context, cluster *e2eCluster, namespace, ca
 		"--source-storage-class", sourceStorageClass,
 		"--target-storage-class", targetStorageClass,
 		"--runner-image", image,
-		"--rsync-args", "-a --delete",
+		"--rclone-args", "--config=/dev/null --links --metadata --create-empty-src-dirs --stats=15s",
 		"--yes",
 	})
 }

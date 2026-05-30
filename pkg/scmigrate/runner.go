@@ -32,8 +32,8 @@ func NewRunner(opts Options, out io.Writer) (*Runner, error) {
 	if opts.Namespace == "" && !opts.AllNamespaces {
 		opts.Namespace = currentNamespace
 	}
-	if opts.RsyncArgs == "" {
-		opts.RsyncArgs = DefaultRsyncArgs
+	if opts.RcloneArgs == "" {
+		opts.RcloneArgs = DefaultRcloneArgs
 	}
 	return &Runner{opts: opts, client: client, out: out}, nil
 }

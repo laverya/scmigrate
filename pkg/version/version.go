@@ -8,7 +8,7 @@ import (
 	"strings"
 )
 
-const RunnerImageRepository = "ghcr.io/laverya/scmigrate-rsync"
+const RunnerImageRepository = "ghcr.io/laverya/scmigrate-runner"
 
 var (
 	Version = "dev"

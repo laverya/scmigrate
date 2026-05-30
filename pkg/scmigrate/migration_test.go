@@ -181,7 +181,7 @@ func TestMigrateResumesFromClusterStateInsteadOfMigrationStruct(t *testing.T) {
 		opts: Options{
 			TargetStorageClass: "new-sc",
 			RunnerImage:        "sync-image:v1",
-			RsyncArgs:          "-a",
+			RcloneArgs:         "--metadata",
 		},
 		client: client,
 		out:    io.Discard,
@@ -314,7 +314,7 @@ func TestDryRunFreshPVCPrintsFullPlanWithoutDestinationPVC(t *testing.T) {
 		opts: Options{
 			TargetStorageClass: "new-sc",
 			RunnerImage:        "sync-image:v1",
-			RsyncArgs:          "-a",
+			RcloneArgs:         "--metadata",
 			DryRun:             true,
 		},
 		client: client,
@@ -435,7 +435,7 @@ func TestMigrateRunsAllPhasesFromFreshPVCUsingClusterState(t *testing.T) {
 		opts: Options{
 			TargetStorageClass:   "new-sc",
 			RunnerImage:          "sync-image:v1",
-			RsyncArgs:            "-a",
+			RcloneArgs:           "--metadata",
 			RestoreReclaimPolicy: true,
 		},
 		client: client,
@@ -493,7 +493,7 @@ func TestRunSyncCreatesPinnedInitialSyncPodAndCleansItUp(t *testing.T) {
 	var createdPods []corev1.Pod
 	succeedCreatedPods(client, &createdPods)
 	runner := &Runner{
-		opts:   Options{TargetStorageClass: "new-sc", RunnerImage: "sync-image:v1", RsyncArgs: "-a --delete"},
+		opts:   Options{TargetStorageClass: "new-sc", RunnerImage: "sync-image:v1", RcloneArgs: "--metadata --links"},
 		client: client,
 		out:    io.Discard,
 	}
@@ -513,7 +513,7 @@ func TestRunSyncCreatesPinnedInitialSyncPodAndCleansItUp(t *testing.T) {
 	if !reflect.DeepEqual(values, []string{"node-a"}) {
 		t.Fatalf("sync pod node affinity values = %#v, want node-a", values)
 	}
-	if pod.Spec.Containers[0].Image != "sync-image:v1" || !reflect.DeepEqual(pod.Spec.Containers[0].Command, []string{"rsync"}) || !reflect.DeepEqual(pod.Spec.Containers[0].Args, []string{"-a", "--delete", "/source/", "/destination/"}) {
+	if pod.Spec.Containers[0].Image != "sync-image:v1" || !reflect.DeepEqual(pod.Spec.Containers[0].Command, []string{"/kubectl-scmigrate", "rclone"}) || !reflect.DeepEqual(pod.Spec.Containers[0].Args, []string{"sync", "--metadata", "--links", "/source", "/destination"}) {
 		t.Fatalf("unexpected sync container: %#v", pod.Spec.Containers[0])
 	}
 	if _, err := client.CoreV1().Pods("default").Get(ctx, pod.Name, metav1.GetOptions{}); err == nil {

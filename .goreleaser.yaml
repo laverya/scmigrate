@@ -39,10 +39,12 @@ checksum:
   name_template: checksums.txt
 
 dockers_v2:
-  - id: scmigrate-rsync
-    dockerfile: Dockerfile.rsync
+  - id: scmigrate-runner
+    ids:
+      - kubectl-scmigrate
+    dockerfile: Dockerfile.runner
     images:
-      - ghcr.io/{{ .Env.GITHUB_REPOSITORY_OWNER }}/scmigrate-rsync
+      - ghcr.io/{{ .Env.GITHUB_REPOSITORY_OWNER }}/scmigrate-runner
     tags:
       - "{{ .Tag }}"
       - "{{ .Version }}"
@@ -52,5 +54,5 @@ dockers_v2:
       - linux/arm64
     labels:
       org.opencontainers.image.source: "https://github.com/{{ .Env.GITHUB_REPOSITORY }}"
-      org.opencontainers.image.description: scmigrate rsync runner image
+      org.opencontainers.image.description: scmigrate rclone runner image
       org.opencontainers.image.version: "{{ .Tag }}"

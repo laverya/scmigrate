@@ -1,6 +1,6 @@
 # scmigrate
 
-`scmigrate` is a `kubectl` plugin and rsync helper image for moving selected
+`scmigrate` is a `kubectl` plugin and rclone-backed helper image for moving selected
 Kubernetes PVCs from one `StorageClass` to another without ever intentionally
 leaving the cluster with only an in-flight copy of the data.
 
@@ -18,11 +18,14 @@ make build VERSION=v0.1.0
 install -m 0755 bin/kubectl-scmigrate ~/.local/bin/kubectl-scmigrate
 ```
 
-Build and push the rsync worker image:
+Build and push the rclone runner image:
 
 ```sh
-RUNNER_IMAGE=ghcr.io/laverya/scmigrate-rsync:v0.1.0
-docker build -f Dockerfile.rsync -t "$RUNNER_IMAGE" .
+RUNNER_IMAGE=ghcr.io/laverya/scmigrate-runner:v0.1.0
+make build VERSION=v0.1.0
+mkdir -p linux/amd64
+cp bin/kubectl-scmigrate linux/amd64/kubectl-scmigrate
+docker build --build-arg TARGETPLATFORM=linux/amd64 -f Dockerfile.runner -t "$RUNNER_IMAGE" .
 docker push "$RUNNER_IMAGE"
 ```
 
@@ -58,8 +61,8 @@ kubectl scmigrate run \
   --yes
 ```
 
-Release-versioned plugin builds default `--runner-image` to the matching rsync
-image tag, for example `ghcr.io/laverya/scmigrate-rsync:v0.1.0`. Dev builds do
+Release-versioned plugin builds default `--runner-image` to the matching runner
+image tag, for example `ghcr.io/laverya/scmigrate-runner:v0.1.0`. Dev builds do
 not guess; pass `--runner-image` explicitly when `kubectl scmigrate version`
 does not show a default runner image.
 
@@ -80,12 +83,12 @@ For each matching bound PVC, the plugin:
 
 1. Records the original PVC metadata/spec in annotations.
 2. Creates a temporary destination PVC using the target storage class.
-3. Starts an rsync pod mounting the source read-only and the destination
+3. Starts a rclone sync pod mounting the source read-only and the destination
    read-write while the workload remains online.
 4. Quiesces every active non-terminal pod that is using that PVC by grouping
    consumers by their owning workload and scaling/deleting each affected parent
    once.
-5. Runs a final rsync pass.
+5. Runs a final rclone sync pass.
 6. Sets both the source PV and destination PV reclaim policies to `Retain`.
 7. Deletes the original and temporary PVCs.
 8. Clears the destination PV `claimRef`.
@@ -159,7 +162,7 @@ state.
 
 - The source PVC must be bound.
 - Only filesystem PVCs are supported. Block-mode PVCs are rejected because the
-  rsync worker mounts PVCs as filesystems.
+  rclone runner mounts PVCs as filesystems.
 - `ReadWriteOncePod` PVCs are rejected because the live initial sync requires a
   second pod to mount the source PVC.
 - The destination storage class must support the requested access modes,
@@ -167,22 +170,24 @@ state.
   workload.
 - PVC selectors are restored on the final PVC. Static PV selectors that only
   matched the old PV can prevent the final PVC from binding to the new PV.
-- The rsync image runs as root so it can preserve ownership and mode bits.
-  Namespaces with restricted Pod Security Admission must allow the migration
+- The runner image runs rclone as root so it can preserve ownership and mode
+  bits when `--metadata` is enabled. Namespaces with restricted Pod Security Admission must allow the migration
   worker pod or run it under a policy that permits the required filesystem
   operations.
 - `run` requires an explicit `--runner-image` with a non-`latest` tag or digest.
   For release-versioned plugin builds, this defaults to the matching
-  `ghcr.io/laverya/scmigrate-rsync:<version>` tag.
-- The default rsync arguments are:
+  `ghcr.io/laverya/scmigrate-runner:<version>` tag.
+- The default rclone arguments passed after `rclone sync` are:
 
 ```text
--aHAX --numeric-ids --delete --info=progress2
+--config=/dev/null --links --metadata --create-empty-src-dirs --stats=15s
 ```
 
-- If the source or target filesystem does not support ACLs or extended
-  attributes, override `--rsync-args` to remove `-A` and/or `-X`.
-- `--rsync-args` is split on whitespace and passed directly to `rsync`; it is
+- `--metadata` asks rclone's local backend to preserve mode, owner, group,
+  timestamps, and supported metadata such as user extended attributes.
+- `--links` is required for local symlink transfer. Rclone does not preserve
+  source hard-link relationships as rsync `-H` did.
+- `--rclone-args` is split on whitespace and passed after `rclone sync`; it is
   not evaluated by a shell.
 - The plugin leaves PV reclaim policies as `Retain` by default. Pass
   `--restore-reclaim-policy` to restore the destination PV's original policy
@@ -236,7 +241,7 @@ Run the kind-backed end-to-end tests:
 make e2e
 ```
 
-The e2e target creates a temporary kind cluster, builds and loads the rsync
-helper image, then verifies real PVC migrations for a `Deployment`,
+The e2e target creates a temporary kind cluster, builds and loads the scratch
+rclone runner image, then verifies real PVC migrations for a `Deployment`,
 `StatefulSet`, and `DaemonSet`. It requires `docker`, `kind`, and `kubectl`.
 Set `KEEP_E2E_CLUSTER=1` to leave the cluster running after the test.

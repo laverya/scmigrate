@@ -80,9 +80,9 @@ on operational risk:
   claimRef patches use JSON Patch tests where the current UID is known. A
   reviewer can still ask for wider UID guards on non-destructive metadata and
   reclaim-policy patches.
-- The rsync worker still runs as root so it can preserve ownership and
-  filesystem metadata, but rsync is now invoked directly with explicit command
-  and argument vectors instead of through `sh -c`.
+- The rclone runner still runs as root so it can preserve ownership and
+  filesystem metadata, and it is invoked through the main `scmigrate` binary
+  with explicit command and argument vectors.
 - `run` no longer defaults to `latest`; release-versioned binaries default to
   the matching runner image tag, and dev builds require an explicit non-`latest`
   tag or digest.

@@ -97,7 +97,7 @@ Suggested direction: update the Docker build image to a Go version compatible
 with `go.mod`, or lower `go.mod` if the code and dependencies support it.
 
 Resolution: the plugin image `Dockerfile` was removed; releases now publish the
-rsync runner image from `Dockerfile.rsync`.
+rclone runner image with the main binary from `Dockerfile.runner`.
 
 ### P2: Some PVC types are copied but cannot actually be synced
 
@@ -156,14 +156,14 @@ Status: Resolved in README documentation.
   operator-owned pods, and custom controllers abort migration.
 - Operators, HPAs, and other reconcilers can fight scale-to-zero operations or
   recreate writers during final sync.
-- Pod Security Admission may reject the root rsync pod, especially in
+- Pod Security Admission may reject the root rclone sync pod, especially in
   restricted namespaces.
 - PVC selectors are restored onto the final PVC. If the original selector was
   intended for a specific static PV, it may prevent binding to the new
   destination PV.
-- Default rsync args include ACL and xattr preservation. Filesystems or storage
-  backends without ACL/xattr support may fail unless users override
-  `--rsync-args`.
+- Default rclone args enable metadata and symlink preservation. Filesystems or
+  storage backends with unusual metadata behavior may require users to override
+  `--rclone-args`.
 - `--skip-initial-sync` implies the final outage includes the entire data copy,
   not just the delta sync.
 
