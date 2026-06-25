@@ -11,33 +11,86 @@ last durable point.
 
 ## Install
 
-Build the kubectl plugin:
+Download the archive for your platform from a tagged release. Archive names use
+the version without the leading `v`; release tags and runner image tags keep the
+leading `v`.
 
 ```sh
-make build VERSION=v0.1.0
-install -m 0755 bin/kubectl-scmigrate ~/.local/bin/kubectl-scmigrate
+TAG=v0.1.0
+VERSION="${TAG#v}"
+OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
+ARCH="$(uname -m)"
+case "$ARCH" in
+  x86_64) ARCH=amd64 ;;
+  arm64|aarch64) ARCH=arm64 ;;
+  *) echo "unsupported architecture: $ARCH" >&2; exit 1 ;;
+esac
+
+ARCHIVE="kubectl-scmigrate_${VERSION}_${OS}_${ARCH}.tar.gz"
+BASE_URL="https://github.com/laverya/scmigrate/releases/download/${TAG}"
+
+curl -fL -o "$ARCHIVE" "$BASE_URL/$ARCHIVE"
+curl -fL -o checksums.txt "$BASE_URL/checksums.txt"
+if command -v sha256sum >/dev/null 2>&1; then
+  grep "  $ARCHIVE$" checksums.txt | sha256sum -c -
+else
+  grep "  $ARCHIVE$" checksums.txt | shasum -a 256 -c -
+fi
+
+tar -xzf "$ARCHIVE"
+mkdir -p ~/.local/bin
+install -m 0755 kubectl-scmigrate ~/.local/bin/kubectl-scmigrate
+kubectl scmigrate version
 ```
 
-Build and push the rclone runner image:
+For Windows, download the `windows_amd64` archive from the same release and put
+`kubectl-scmigrate.exe` on `PATH`.
 
-```sh
-RUNNER_IMAGE=ghcr.io/laverya/scmigrate-runner:v0.1.0
-make build VERSION=v0.1.0
-mkdir -p linux/amd64
-cp bin/kubectl-scmigrate linux/amd64/kubectl-scmigrate
-docker build --build-arg TARGETPLATFORM=linux/amd64 -f Dockerfile.runner -t "$RUNNER_IMAGE" .
-docker push "$RUNNER_IMAGE"
+Tagged releases publish a matching runner image at:
+
+```text
+ghcr.io/laverya/scmigrate-runner:v0.1.0
 ```
 
-Apply RBAC for an in-cluster runner, or grant equivalent rights to the user that
-runs the plugin. StatefulSet migrations require permission to delete and
-recreate StatefulSets; `scmigrate` also creates a migration-managed ConfigMap
-restore record when it uses the StatefulSet orphaning path.
+Release binaries default `--runner-image` to the matching `vX.Y.Z` image tag, so
+you normally do not need to build or push a runner image yourself. The release
+workflow also publishes a bare `X.Y.Z` tag and `latest`, but `scmigrate run`
+intentionally rejects `latest`; use a version tag or digest for migrations.
+
+### Permissions
+
+`scmigrate` uses the credentials in your current kubeconfig. The user, group, or
+service account that runs `kubectl scmigrate` must be allowed to list
+namespaces and to list or mutate PVCs, PVs, pods, supported workload
+controllers, and the migration-managed ConfigMaps used for StatefulSet restore
+records.
+
+`deploy/rbac.yaml` provides the required ClusterRole and binds it to the
+`scmigrate-system/scmigrate` ServiceAccount. Use it directly only if you will run
+the plugin with that service account's credentials. For a local `kubectl`
+workflow, ask a cluster admin to bind the `scmigrate` ClusterRole to the actual
+kube user or group that will run the migration.
+
+To install that template role and service-account binding:
 
 ```sh
 kubectl create namespace scmigrate-system
 kubectl apply -f deploy/rbac.yaml
 ```
+
+Before running a real migration, verify permissions in the namespaces you plan
+to touch:
+
+```sh
+kubectl auth can-i list persistentvolumeclaims --all-namespaces
+kubectl auth can-i patch persistentvolumes
+kubectl auth can-i create pods -n default
+kubectl auth can-i patch deployments.apps -n default
+```
+
+StatefulSet migrations require permission to delete and recreate StatefulSets.
+DaemonSet migrations require permission to patch DaemonSets and delete affected
+pods.
 
 ## Usage
 
@@ -229,6 +282,34 @@ flags to resume.
 
 ## Development
 
+Build the kubectl plugin from source:
+
+```sh
+make build VERSION=dev
+mkdir -p ~/.local/bin
+install -m 0755 bin/kubectl-scmigrate ~/.local/bin/kubectl-scmigrate
+```
+
+Source-built binaries may not have a release-version default runner image. For
+local testing, build a runner image with a non-`latest` tag, push it to a
+registry your target cluster can pull from, and pass it to `run`:
+
+```sh
+RUNNER_IMAGE=ghcr.io/you/scmigrate-runner:dev-test
+make build VERSION=dev
+mkdir -p linux/amd64
+cp bin/kubectl-scmigrate linux/amd64/kubectl-scmigrate
+docker build --build-arg TARGETPLATFORM=linux/amd64 -f Dockerfile.runner -t "$RUNNER_IMAGE" .
+docker push "$RUNNER_IMAGE"
+
+kubectl scmigrate run \
+  --namespace default \
+  --selector app=postgres \
+  --target-storage-class new-sc \
+  --runner-image "$RUNNER_IMAGE" \
+  --yes
+```
+
 Run unit tests:
 
 ```sh
@@ -241,7 +322,24 @@ Run the kind-backed end-to-end tests:
 make e2e
 ```
 
-The e2e target creates a temporary kind cluster, builds and loads the scratch
-rclone runner image, then verifies real PVC migrations for a `Deployment`,
-`StatefulSet`, and `DaemonSet`. It requires `docker`, `kind`, and `kubectl`.
-Set `KEEP_E2E_CLUSTER=1` to leave the cluster running after the test.
+The e2e target creates temporary kind clusters, builds and loads the scratch
+rclone runner image, then verifies real PVC migrations for `Deployment`,
+`StatefulSet`, `DaemonSet`, shared-PVC, multi-parent, and etcd StatefulSet
+cases. It requires `docker`, `kind`, and `kubectl`. Set `KEEP_E2E_CLUSTER=1` to
+leave the cluster running after the test.
+
+## Releasing
+
+Public releases are created by pushing a `v*` tag. The release workflow first
+checks that the tagged commit already has a successful `Test` workflow run, then
+GoReleaser publishes:
+
+- `kubectl-scmigrate` archives for Linux, macOS, and Windows
+- `checksums.txt`
+- the `ghcr.io/laverya/scmigrate-runner` image for `linux/amd64` and
+  `linux/arm64`
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
