@@ -45,15 +45,29 @@ jobs:
         run: make build
 
   image:
-    name: Build rsync runner image
+    name: Build rclone runner image
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Build rsync runner image
-        run: docker build -f Dockerfile.rsync -t scmigrate-rsync:ci .
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build binary
+        run: make build
+
+      - name: Prepare runner image context
+        run: |
+          mkdir -p linux/amd64
+          cp bin/kubectl-scmigrate linux/amd64/kubectl-scmigrate
+
+      - name: Build rclone runner image
+        run: docker build --build-arg TARGETPLATFORM=linux/amd64 -f Dockerfile.runner -t scmigrate-runner:ci .
 
   e2e:
     name: End-to-end tests
