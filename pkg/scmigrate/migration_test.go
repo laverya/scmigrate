@@ -3,6 +3,7 @@ package scmigrate
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"reflect"
 	"strings"
@@ -85,6 +86,88 @@ func TestPrepareCreatesDestinationAndStoresDurableAnnotations(t *testing.T) {
 	}
 }
 
+func TestPrepareRejectsUnexpectedExistingDestinationPVC(t *testing.T) {
+	ctx := testContext(t)
+	source := boundPVC("default", "data", "source-pv", "old-sc")
+	dest := boundPVC("default", tempPVCName(source), "other-pv", "new-sc")
+	client := fake.NewSimpleClientset(source, dest)
+	runner := &Runner{opts: Options{TargetStorageClass: "new-sc"}, client: client, out: io.Discard}
+
+	err := runner.prepare(ctx, source)
+	if err == nil || !strings.Contains(err.Error(), "destination pvc/") {
+		t.Fatalf("prepare() error = %v, want unexpected destination error", err)
+	}
+}
+
+func TestCreateFinalPVCRejectsNameCollision(t *testing.T) {
+	ctx := testContext(t)
+	original := boundPVC("default", "data", "source-pv", "old-sc")
+	snapshot, err := pvcSnapshot(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	collision := boundPVC("default", "data", "unrelated-pv", "new-sc")
+	runner := &Runner{opts: Options{TargetStorageClass: "new-sc"}, client: fake.NewSimpleClientset(collision), out: io.Discard}
+
+	_, err = runner.createFinalPVC(ctx, snapshot, "dest", "dest-pv", "")
+	if err == nil || !strings.Contains(err.Error(), "already exists bound to volume") {
+		t.Fatalf("createFinalPVC() error = %v, want name collision error", err)
+	}
+}
+
+func TestStoreQuiesceAnnotationReturnsDestinationLookupError(t *testing.T) {
+	ctx := testContext(t)
+	source := boundPVC("default", "data", "source-pv", "old-sc")
+	source.Annotations[AnnDestinationPVC] = "dest"
+	client := fake.NewSimpleClientset(source)
+	client.PrependReactor("get", "persistentvolumeclaims", func(action ktesting.Action) (bool, runtime.Object, error) {
+		get := action.(ktesting.GetAction)
+		if get.GetName() == "dest" {
+			return true, nil, errors.New("temporary API failure")
+		}
+		return false, nil, nil
+	})
+	runner := &Runner{client: client, out: io.Discard}
+
+	err := runner.storeQuiesceRecords(ctx, source, []QuiesceRecord{{Kind: WorkloadKindNone, Namespace: "default"}})
+	if err == nil || !strings.Contains(err.Error(), "temporary API failure") {
+		t.Fatalf("storeQuiesceRecords() error = %v, want destination lookup error", err)
+	}
+}
+
+func TestPatchPVCAnnotationsPreservesConcurrentAnnotations(t *testing.T) {
+	ctx := testContext(t)
+	stale := boundPVC("default", "data", "source-pv", "old-sc")
+	current := stale.DeepCopy()
+	current.Annotations["example.com/concurrent"] = "preserve-me"
+	client := fake.NewSimpleClientset(current)
+	runner := &Runner{client: client, out: io.Discard}
+
+	if err := runner.patchPVCAnnotations(ctx, stale, map[string]string{AnnState: StatePrepared}); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := client.CoreV1().PersistentVolumeClaims("default").Get(ctx, "data", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Annotations["example.com/concurrent"] != "preserve-me" || updated.Annotations[AnnState] != StatePrepared {
+		t.Fatalf("annotations = %#v, want concurrent annotation and migration state", updated.Annotations)
+	}
+}
+
+func TestPatchPVCAnnotationsRejectsReplacementPVC(t *testing.T) {
+	ctx := testContext(t)
+	original := boundPVC("default", "data", "source-pv", "old-sc")
+	replacement := original.DeepCopy()
+	replacement.UID = "replacement-uid"
+	runner := &Runner{client: fake.NewSimpleClientset(replacement), out: io.Discard}
+
+	err := runner.patchPVCAnnotations(ctx, original, map[string]string{AnnState: StatePrepared})
+	if err == nil || !strings.Contains(err.Error(), "was replaced") {
+		t.Fatalf("patchPVCAnnotations() error = %v, want replacement error", err)
+	}
+}
+
 func TestDiscoverUsesClusterStateAndSortsResumablePVCs(t *testing.T) {
 	ctx := testContext(t)
 	data0 := boundPVC("default", "data-0", "source-pv-0", "old-sc")
@@ -149,6 +232,28 @@ func TestDiscoverUsesClusterStateAndSortsResumablePVCs(t *testing.T) {
 	}
 	if len(migrations[1].Consumers) != 1 || migrations[1].Consumers[0].Workload.Name != "app" {
 		t.Fatalf("unexpected consumers: %#v", migrations[1].Consumers)
+	}
+}
+
+func TestDiscoverListsClusterScopedPVsOnceAcrossNamespaces(t *testing.T) {
+	ctx := testContext(t)
+	client := fake.NewSimpleClientset(
+		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "one"}},
+		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "two"}},
+	)
+	runner := &Runner{opts: Options{AllNamespaces: true, TargetStorageClass: "new-sc"}, client: client, out: io.Discard}
+
+	if _, err := runner.discover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	listCount := 0
+	for _, action := range client.Actions() {
+		if action.GetVerb() == "list" && action.GetResource().Resource == "persistentvolumes" {
+			listCount++
+		}
+	}
+	if listCount != 1 {
+		t.Fatalf("persistent volume list count = %d, want 1", listCount)
 	}
 }
 
@@ -522,6 +627,27 @@ func TestRunSyncCreatesPinnedInitialSyncPodAndCleansItUp(t *testing.T) {
 	assertDeleteUIDPrecondition(t, client.Actions(), "pods", pod.Name, pod.UID)
 }
 
+func TestRunSyncRejectsUnexpectedExistingPod(t *testing.T) {
+	ctx := testContext(t)
+	source := boundPVC("default", "data", "source-pv", "old-sc")
+	source.Annotations[AnnDestinationPVC] = "dest"
+	dest := boundPVC("default", "dest", "dest-pv", "new-sc")
+	collision := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: syncPodName(source, SyncPhaseInitial), Namespace: "default"},
+		Status:     corev1.PodStatus{Phase: corev1.PodSucceeded},
+	}
+	runner := &Runner{
+		opts:   Options{TargetStorageClass: "new-sc", RunnerImage: "example.test/runner:v1"},
+		client: fake.NewSimpleClientset(source, dest, collision),
+		out:    io.Discard,
+	}
+
+	err := runner.runSync(ctx, source, SyncPhaseInitial)
+	if err == nil || !strings.Contains(err.Error(), "without the expected scmigrate sync identity") {
+		t.Fatalf("runSync() error = %v, want sync pod identity error", err)
+	}
+}
+
 func TestValidateRunnerImageRequiresPinnedOrVersionedReference(t *testing.T) {
 	for _, image := range []string{"sync-image:v1", "registry:5000/sync-image:v1", "sync-image@sha256:abc"} {
 		if err := validateRunnerImage(image); err != nil {
@@ -624,9 +750,11 @@ func TestResumeCutoverWithoutSourceCreatesFinalPVCFromDestination(t *testing.T) 
 	dest.Annotations[AnnSourcePVC] = "data"
 	dest.Annotations[AnnOriginalPVC] = snapshot
 	dest.Annotations[AnnQuiesce] = `[{"kind":"None","namespace":"default"}]`
-	client := fake.NewSimpleClientset(dest, pv("dest-pv", "default", "dest", corev1.PersistentVolumeReclaimRetain))
+	destPV := pv("dest-pv", "default", "dest", corev1.PersistentVolumeReclaimRetain)
+	destPV.Annotations[AnnOriginalDestRP] = string(corev1.PersistentVolumeReclaimDelete)
+	client := fake.NewSimpleClientset(dest, destPV)
 	bindCreatedPVCs(client)
-	runner := &Runner{opts: Options{TargetStorageClass: "new-sc"}, client: client, out: io.Discard}
+	runner := &Runner{opts: Options{TargetStorageClass: "new-sc", RestoreReclaimPolicy: true}, client: client, out: io.Discard}
 
 	if err := runner.resumeCutoverWithoutSource(ctx, "default", "data"); err != nil {
 		t.Fatalf("resumeCutoverWithoutSource returned error: %v", err)
@@ -642,12 +770,15 @@ func TestResumeCutoverWithoutSourceCreatesFinalPVCFromDestination(t *testing.T) 
 	if _, err := client.CoreV1().PersistentVolumeClaims("default").Get(ctx, "dest", metav1.GetOptions{}); err == nil {
 		t.Fatal("temporary destination PVC still exists")
 	}
-	destPV, err := client.CoreV1().PersistentVolumes().Get(ctx, "dest-pv", metav1.GetOptions{})
+	destPV, err = client.CoreV1().PersistentVolumes().Get(ctx, "dest-pv", metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("get dest pv: %v", err)
 	}
 	if destPV.Spec.ClaimRef != nil {
 		t.Fatalf("dest PV claimRef was not cleared: %#v", destPV.Spec.ClaimRef)
+	}
+	if destPV.Spec.PersistentVolumeReclaimPolicy != corev1.PersistentVolumeReclaimDelete {
+		t.Fatalf("dest PV reclaim policy = %s, want Delete", destPV.Spec.PersistentVolumeReclaimPolicy)
 	}
 }
 

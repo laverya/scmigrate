@@ -1,93 +1,72 @@
-# scmigrate Maintainability Review
+# scmigrate Architecture and Maintainability Review
 
-This note captures the readability and reviewability issues found in the main
-migration code, plus the order to address them.
+This document describes the current code layout and the safety boundaries that
+matter during review. It replaces the original cleanup checklist, whose file
+references and pending work items no longer matched the implementation.
 
-## Readability Findings
+## Architecture
 
-The main migration story is understandable from the README, but harder to audit
-in code than it needs to be. `pkg/scmigrate/runner.go` contains public
-entry points, migration orchestration, discovery, dry-run projection, sync pod
-construction, cutover, resume logic, Kubernetes patch helpers, wait helpers, and
-pod-to-workload lookup. `pkg/scmigrate/workload.go` contains workload
-quiesce planning, mutation, restore, and assorted helpers.
+The `pkg/scmigrate` package is organized around the migration lifecycle:
 
-The top-level order in `runner.go` starts well: `NewRunner`, `Plan`, `Run`, and
-`migrate`. After that, the human story becomes harder to follow. The migration
-phase order is:
+- `runner.go` owns construction and the public `Plan` and `Run` entry points.
+- `validation.go` validates CLI options, filters, and supported PVC modes.
+- `discovery.go` selects fresh and resumable migrations from cluster state.
+- `migration.go` is the phase orchestrator and reloads durable state after each
+  phase.
+- `sync.go` prepares destination PVCs and runs initial/final rclone pods.
+- `workload_quiesce.go`, `workload_apply.go`, and `workload_restore.go` plan,
+  apply, and reverse workload-specific mutations.
+- `cutover.go` owns reclaim-policy changes, durable PV recovery records, PVC
+  replacement, and cutover resume paths.
+- `metadata.go` and `kube_helpers.go` contain serialization, generated names,
+  guarded patches/deletes, waits, and pod-to-workload resolution.
+- `dry_run.go` projects the same lifecycle without mutating the cluster.
 
-1. Prepare destination PVC and durable annotations.
-2. Run the live initial sync.
-3. Quiesce workload writers.
-4. Run the final sync.
-5. Cut over PV/PVC bindings.
-6. Restore workloads.
+The intended phase order remains prepare, optional initial sync, quiesce, final
+sync, cutover, then workload restore. `AnnState` records the durable boundary
+between phases; the migration struct is discovery output, not the source of
+truth for resume.
 
-The implementations of those phases are split across `runner.go` and
-`workload.go`, so a reviewer has to jump between files to audit the riskiest
-flow.
+## Safety Invariants
 
-## Comments
+- Unknown migration states and malformed selection filters fail closed.
+- Temporary PVCs, final PVCs, sync pods, restore ConfigMaps, and workload
+  controllers are identity-checked before existing objects are reused.
+- Quiesce records are namespace-scoped and persist workload/pod UIDs so a
+  delete/recreate race cannot redirect a retry to a same-name replacement.
+- Destructive deletes use UID preconditions. JSON patches test object UID and
+  resource version, and claimRef removal also tests the recorded claim identity.
+- The destination PV receives the original PVC and quiesce records before both
+  PVC objects can disappear.
+- Every cutover resume path uses the same final-PVC constructor and honors the
+  reclaim-policy restore option.
+- Generated sync pod names retain their UID-derived hash even when truncated.
 
-The core implementation has almost no local comments. The README explains the
-system, but code that changes reclaim policies, deletes PVCs, clears PV
-`claimRef`s, or temporarily mutates controllers should carry short invariant
-comments where the risk occurs.
+## Deliberate Operational Boundaries
 
-Recommended comment targets:
+- The RBAC role is necessarily broad because the tool patches and deletes PVCs,
+  PVs, pods, and supported controllers.
+- A writer created after the final consumer check can still race cutover.
+  External reconcilers that can create writers must be paused by the operator.
+- The rclone container runs as root to preserve filesystem ownership and mode.
+- Dry-run is a local projection; it cannot prove admission, RBAC, scheduling,
+  storage binding, or Pod Security behavior.
+- Filesystem quiescence is not application-aware consistency. Databases may
+  still require application-level flush or shutdown procedures.
+- Retained source PVs and StatefulSet restore ConfigMaps remain operator-managed
+  recovery artifacts, as documented in the README.
 
-- `migrate`: phase order and the resume record used by each phase.
-- `cutover`: why the destination PV is annotated before deleting PVC objects.
-- `runSync`: why the initial sync pod may be pinned to a workload node.
-- StatefulSet quiesce: why orphan/delete/recreate is used for one-pod-at-a-time
-  migration.
-- DaemonSet quiesce: why `OnDelete` plus node affinity exclusions are used.
-- `stateBefore`: valid state ordering and invalid-state behavior.
+## Verification
 
-## Ordered Work Items
+The repository is expected to pass:
 
-1. Split `runner.go` by responsibility: migration orchestration, discovery,
-   sync pods, cutover/resume, Kubernetes helpers.
-2. Reorder `workload.go` around the lifecycle: quiesce planning, quiesce
-   application, restore, then helpers.
-3. Extract duplicated final-PVC recreation from the normal and resumable
-   cutover paths.
-4. Replace stringly states and workload/quiesce kinds with named constants,
-   including the implicit `"new"` state.
-5. Remove or justify unused/test-only helpers and fields, including
-   `Runner.namespace`, `defaultKubeconfigPath`, `mergeAnnotations`, and
-   convenience quiesce wrappers.
-6. Validate unknown migration states instead of treating missing map keys as
-   phase zero.
-7. Add short invariant comments at risky transitions.
-8. Run formatting and the unit test suite.
+```sh
+make test
+GOCACHE=/tmp/scmigrate-go-cache go vet ./...
+GOCACHE=/tmp/scmigrate-go-cache go test -race ./...
+make build
+make e2e
+```
 
-## Hostile Reviewer Ammunition
-
-A skeptical reviewer who did not want to allow this project would likely focus
-on operational risk:
-
-- The shipped RBAC grants broad and destructive access: create, patch, and delete
-  permissions on PVCs, PVs, pods, and StatefulSets.
-- Cutover intentionally deletes the source PVC and temporary destination PVC,
-  clears the destination PV `claimRef`, then recreates the final PVC. The resume
-  model reduces the risk, but the operation is still high-impact.
-- Consumer discovery now considers all non-terminal pods and rechecks for
-  active consumers immediately before cutover. A hostile reviewer can still
-  point at the remaining race window between that last recheck and the PVC/PV
-  mutations if an external actor creates new writers at exactly the wrong time.
-- The highest-risk deletes now use UID preconditions, and controller/PV
-  claimRef patches use JSON Patch tests where the current UID is known. A
-  reviewer can still ask for wider UID guards on non-destructive metadata and
-  reclaim-policy patches.
-- The rclone runner still runs as root so it can preserve ownership and
-  filesystem metadata, and it is invoked through the main `scmigrate` binary
-  with explicit command and argument vectors.
-- `run` no longer defaults to `latest`; release-versioned binaries default to
-  the matching runner image tag, and dev builds require an explicit non-`latest`
-  tag or digest.
-- Dry-run is a local textual projection. It does not prove RBAC, admission,
-  binding, scheduling, or Pod Security success.
-- Application consistency is outside the tool's proof. The tool stops writers
-  and copies files, but it does not provide database-aware hooks, fsfreeze, or
-  application-level flush verification.
+The kind-backed suite covers Deployment, StatefulSet, DaemonSet, shared-PVC,
+multi-parent, three-replica StatefulSet, and live etcd migration scenarios.

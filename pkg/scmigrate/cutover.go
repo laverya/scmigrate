@@ -2,7 +2,6 @@ package scmigrate
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 
 	corev1 "k8s.io/api/core/v1"
@@ -26,11 +25,14 @@ func (r *Runner) cutover(ctx context.Context, source *corev1.PersistentVolumeCla
 		return err
 	}
 	if dest.Spec.VolumeName == "" {
-		if err := r.waitPVCBound(ctx, dest.Namespace, dest.Name); err != nil {
+		if err := r.waitPVCBound(ctx, dest.Namespace, dest.Name, dest.UID); err != nil {
 			return err
 		}
 		dest, err = r.destinationPVC(ctx, source)
 		if err != nil {
+			return err
+		}
+		if err := r.validateDestinationPVC(dest, source); err != nil {
 			return err
 		}
 	}
@@ -74,10 +76,10 @@ func (r *Runner) cutover(ctx context.Context, source *corev1.PersistentVolumeCla
 	if err := r.client.CoreV1().PersistentVolumeClaims(dest.Namespace).Delete(ctx, dest.Name, deleteOptionsForUID(dest.UID)); err != nil && !apierrors.IsNotFound(err) {
 		return err
 	}
-	if err := r.waitPVCGone(ctx, source.Namespace, source.Name); err != nil {
+	if err := r.waitPVCGone(ctx, source.Namespace, source.Name, source.UID); err != nil {
 		return err
 	}
-	if err := r.waitPVCGone(ctx, dest.Namespace, dest.Name); err != nil {
+	if err := r.waitPVCGone(ctx, dest.Namespace, dest.Name, dest.UID); err != nil {
 		return err
 	}
 	if err := r.clearPVClaimRef(ctx, dest.Spec.VolumeName); err != nil {
@@ -141,14 +143,19 @@ func (r *Runner) resumeCutoverWithoutSource(ctx context.Context, namespace, name
 	if err := r.client.CoreV1().PersistentVolumeClaims(namespace).Delete(ctx, dest.Name, deleteOptionsForUID(dest.UID)); err != nil && !apierrors.IsNotFound(err) {
 		return err
 	}
-	if err := r.waitPVCGone(ctx, namespace, dest.Name); err != nil {
+	if err := r.waitPVCGone(ctx, namespace, dest.Name, dest.UID); err != nil {
 		return err
 	}
 	if err := r.clearPVClaimRef(ctx, dest.Spec.VolumeName); err != nil {
 		return err
 	}
-	_, err = r.createFinalPVC(ctx, dest.Annotations[AnnOriginalPVC], dest.Name, dest.Spec.VolumeName, dest.Annotations[AnnQuiesce])
-	return err
+	if _, err := r.createFinalPVC(ctx, dest.Annotations[AnnOriginalPVC], dest.Name, dest.Spec.VolumeName, dest.Annotations[AnnQuiesce]); err != nil {
+		return err
+	}
+	if r.opts.RestoreReclaimPolicy {
+		return r.restoreDestinationReclaimPolicy(ctx, dest.Spec.VolumeName)
+	}
+	return nil
 }
 
 func (r *Runner) persistCutoverRecord(ctx context.Context, source, dest *corev1.PersistentVolumeClaim, destPV *corev1.PersistentVolume) error {
@@ -172,9 +179,22 @@ func (r *Runner) persistCutoverRecord(ctx context.Context, source, dest *corev1.
 		fmt.Fprintf(r.out, "dry-run: persist cutover record on pv/%s\n", destPV.Name)
 		return nil
 	}
-	payload := map[string]any{"metadata": map[string]any{"annotations": annotations}}
-	data, _ := json.Marshal(payload)
-	_, err := r.client.CoreV1().PersistentVolumes().Patch(ctx, destPV.Name, types.MergePatchType, data, metav1.PatchOptions{})
+	current, err := r.client.CoreV1().PersistentVolumes().Get(ctx, destPV.Name, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+	if err := ensureUID("pv", current.Name, destPV.UID, current.UID); err != nil {
+		return err
+	}
+	merged := cloneMap(current.Annotations)
+	for key, value := range annotations {
+		merged[key] = value
+	}
+	data, err := jsonPatchForObject(current, jsonPatchOperation{Op: "add", Path: "/metadata/annotations", Value: merged})
+	if err != nil {
+		return err
+	}
+	_, err = r.client.CoreV1().PersistentVolumes().Patch(ctx, destPV.Name, types.JSONPatchType, data, metav1.PatchOptions{})
 	return err
 }
 
@@ -222,13 +242,42 @@ func (r *Runner) createFinalPVC(ctx context.Context, originalPVC, destinationPVC
 	}
 	finalPVC.Annotations[AnnDestinationPVC] = destinationPVC
 	finalPVC.Annotations[AnnOriginalPVC] = originalPVC
-	if _, err := r.client.CoreV1().PersistentVolumeClaims(finalPVC.Namespace).Create(ctx, finalPVC, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
+	created, err := r.client.CoreV1().PersistentVolumeClaims(finalPVC.Namespace).Create(ctx, finalPVC, metav1.CreateOptions{})
+	if apierrors.IsAlreadyExists(err) {
+		created, err = r.client.CoreV1().PersistentVolumeClaims(finalPVC.Namespace).Get(ctx, finalPVC.Name, metav1.GetOptions{})
+		if err != nil {
+			return nil, err
+		}
+		if err := validateExistingFinalPVC(created, finalPVC); err != nil {
+			return nil, err
+		}
+	} else if err != nil {
 		return nil, err
 	}
-	if err := r.waitPVCBound(ctx, finalPVC.Namespace, finalPVC.Name); err != nil {
+	if err := r.waitPVCBound(ctx, finalPVC.Namespace, finalPVC.Name, created.UID); err != nil {
 		return nil, err
 	}
-	return finalPVC, nil
+	return created, nil
+}
+
+func validateExistingFinalPVC(existing, expected *corev1.PersistentVolumeClaim) error {
+	if existing.Spec.VolumeName != expected.Spec.VolumeName {
+		return fmt.Errorf("pvc/%s already exists bound to volume %q, expected %q", existing.Name, existing.Spec.VolumeName, expected.Spec.VolumeName)
+	}
+	if storageClass(existing) != storageClass(expected) {
+		return fmt.Errorf("pvc/%s already exists with storageClass %q, expected %q", existing.Name, storageClass(existing), storageClass(expected))
+	}
+	if existing.Annotations[AnnOriginalPVC] != expected.Annotations[AnnOriginalPVC] || existing.Annotations[AnnDestinationPV] != expected.Annotations[AnnDestinationPV] {
+		return fmt.Errorf("pvc/%s already exists without the expected scmigrate cutover record", existing.Name)
+	}
+	state, err := normalizeMigrationState(existing.Annotations[AnnState])
+	if err != nil {
+		return fmt.Errorf("pvc/%s: %w", existing.Name, err)
+	}
+	if state != StateCutover && state != StateRestored {
+		return fmt.Errorf("pvc/%s already exists in state %q, expected %q or %q", existing.Name, state, StateCutover, StateRestored)
+	}
+	return nil
 }
 
 func quiesceRecord(primary, fallback map[string]string) string {
@@ -247,12 +296,19 @@ func (r *Runner) retainPV(ctx context.Context, pv *corev1.PersistentVolume, orig
 		fmt.Fprintf(r.out, "dry-run: set pv/%s reclaimPolicy=Retain\n", pv.Name)
 		return nil
 	}
-	payload := map[string]any{
-		"metadata": map[string]any{"annotations": annotations},
-		"spec":     map[string]any{"persistentVolumeReclaimPolicy": string(corev1.PersistentVolumeReclaimRetain)},
+	merged := cloneMap(pv.Annotations)
+	for key, value := range annotations {
+		merged[key] = value
 	}
-	data, _ := json.Marshal(payload)
-	_, err := r.client.CoreV1().PersistentVolumes().Patch(ctx, pv.Name, types.MergePatchType, data, metav1.PatchOptions{})
+	data, err := jsonPatchForObject(
+		pv,
+		jsonPatchOperation{Op: "add", Path: "/metadata/annotations", Value: merged},
+		jsonPatchOperation{Op: "add", Path: "/spec/persistentVolumeReclaimPolicy", Value: string(corev1.PersistentVolumeReclaimRetain)},
+	)
+	if err != nil {
+		return err
+	}
+	_, err = r.client.CoreV1().PersistentVolumes().Patch(ctx, pv.Name, types.JSONPatchType, data, metav1.PatchOptions{})
 	return err
 }
 
@@ -276,7 +332,7 @@ func (r *Runner) clearPVClaimRef(ctx context.Context, pvName string) error {
 		ops = append(ops, jsonPatchOperation{Op: "test", Path: "/spec/claimRef/uid", Value: string(pv.Spec.ClaimRef.UID)})
 	}
 	ops = append(ops, jsonPatchOperation{Op: "remove", Path: "/spec/claimRef"})
-	patch, err := jsonPatchWithUIDTest(pv.UID, ops...)
+	patch, err := jsonPatchForObject(pv, ops...)
 	if err != nil {
 		return err
 	}
@@ -296,8 +352,15 @@ func (r *Runner) restoreDestinationReclaimPolicy(ctx context.Context, pvName str
 	if policy == "" {
 		return nil
 	}
-	payload := map[string]any{"spec": map[string]any{"persistentVolumeReclaimPolicy": policy}}
-	data, _ := json.Marshal(payload)
-	_, err = r.client.CoreV1().PersistentVolumes().Patch(ctx, pvName, types.MergePatchType, data, metav1.PatchOptions{})
+	switch corev1.PersistentVolumeReclaimPolicy(policy) {
+	case corev1.PersistentVolumeReclaimDelete, corev1.PersistentVolumeReclaimRetain, corev1.PersistentVolumeReclaimRecycle:
+	default:
+		return fmt.Errorf("pv/%s has invalid recorded reclaim policy %q", pvName, policy)
+	}
+	data, err := jsonPatchForObject(pv, jsonPatchOperation{Op: "add", Path: "/spec/persistentVolumeReclaimPolicy", Value: policy})
+	if err != nil {
+		return err
+	}
+	_, err = r.client.CoreV1().PersistentVolumes().Patch(ctx, pvName, types.JSONPatchType, data, metav1.PatchOptions{})
 	return err
 }

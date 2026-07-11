@@ -8,6 +8,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 func (r *Runner) prepare(ctx context.Context, source *corev1.PersistentVolumeClaim) error {
@@ -37,8 +38,8 @@ func (r *Runner) prepare(ctx context.Context, source *corev1.PersistentVolumeCla
 		return err
 	}
 
-	if _, err := r.destinationPVC(ctx, source); err == nil {
-		return nil
+	if existing, err := r.destinationPVC(ctx, source); err == nil {
+		return r.validateDestinationPVC(existing, source)
 	} else if !apierrors.IsNotFound(err) {
 		return err
 	}
@@ -77,11 +78,40 @@ func (r *Runner) prepare(ctx context.Context, source *corev1.PersistentVolumeCla
 		return nil
 	}
 	created, err := r.client.CoreV1().PersistentVolumeClaims(source.Namespace).Create(ctx, dest, metav1.CreateOptions{})
-	if err != nil && !apierrors.IsAlreadyExists(err) {
+	if apierrors.IsAlreadyExists(err) {
+		existing, getErr := r.client.CoreV1().PersistentVolumeClaims(source.Namespace).Get(ctx, dest.Name, metav1.GetOptions{})
+		if getErr != nil {
+			return getErr
+		}
+		return r.validateDestinationPVC(existing, source)
+	}
+	if err != nil {
 		return err
 	}
-	if err == nil {
-		fmt.Fprintf(r.out, "created destination pvc/%s\n", created.Name)
+	fmt.Fprintf(r.out, "created destination pvc/%s\n", created.Name)
+	return nil
+}
+
+func (r *Runner) validateDestinationPVC(dest, source *corev1.PersistentVolumeClaim) error {
+	expected := []struct {
+		key   string
+		value string
+	}{
+		{AnnSourcePVC, source.Name},
+		{AnnSourceNamespace, source.Namespace},
+		{AnnSourceUID, string(source.UID)},
+		{AnnTargetStorageClass, r.opts.TargetStorageClass},
+	}
+	for _, item := range expected {
+		if dest.Annotations[item.key] != item.value {
+			return fmt.Errorf("destination pvc/%s has %s=%q, expected %q", dest.Name, item.key, dest.Annotations[item.key], item.value)
+		}
+	}
+	if dest.Labels[LabelManagedBy] != ManagedByValue || dest.Labels[LabelRole] != "destination" || dest.Labels[LabelSourceUID] != string(source.UID) {
+		return fmt.Errorf("pvc/%s already exists but is not an scmigrate destination", dest.Name)
+	}
+	if storageClass(dest) != r.opts.TargetStorageClass {
+		return fmt.Errorf("destination pvc/%s uses storageClass %q, expected %q", dest.Name, storageClass(dest), r.opts.TargetStorageClass)
 	}
 	return nil
 }
@@ -100,29 +130,29 @@ func (r *Runner) runSync(ctx context.Context, source *corev1.PersistentVolumeCla
 		return nil
 	}
 	if old, err := r.client.CoreV1().Pods(source.Namespace).Get(ctx, podName, metav1.GetOptions{}); err == nil {
+		if err := r.validateSyncPod(old, source, dest); err != nil {
+			return err
+		}
 		if old.Status.Phase == corev1.PodSucceeded {
 			fmt.Fprintf(r.out, "%s sync already completed by pod/%s\n", phase, podName)
-			return r.cleanupSyncPod(ctx, source.Namespace, podName)
+			return r.cleanupSyncPod(ctx, source.Namespace, podName, old.UID)
 		}
 		if old.Status.Phase == corev1.PodFailed {
 			_ = r.deletePod(ctx, old)
-			if err := r.waitPodGone(ctx, source.Namespace, podName); err != nil {
+			if err := r.waitPodGone(ctx, source.Namespace, podName, old.UID); err != nil {
 				return err
 			}
 		} else {
-			if err := r.waitPodSucceeded(ctx, source.Namespace, podName); err != nil {
+			if err := r.waitPodSucceeded(ctx, source.Namespace, podName, old.UID); err != nil {
 				return err
 			}
-			return r.cleanupSyncPod(ctx, source.Namespace, podName)
+			return r.cleanupSyncPod(ctx, source.Namespace, podName, old.UID)
 		}
 	} else if !apierrors.IsNotFound(err) {
 		return err
 	}
 
-	command, args, err := rcloneCommand(r.opts.RcloneArgs)
-	if err != nil {
-		return err
-	}
+	command, args := rcloneCommand(r.opts.RcloneArgs)
 	nodeName := ""
 	if phase == SyncPhaseInitial {
 		// For WaitForFirstConsumer or topology-constrained storage, the initial
@@ -173,21 +203,33 @@ func (r *Runner) runSync(ctx context.Context, source *corev1.PersistentVolumeCla
 	if nodeName != "" {
 		pod.Spec.Affinity = affinityForNode(nodeName)
 	}
-	if _, err := r.client.CoreV1().Pods(source.Namespace).Create(ctx, pod, metav1.CreateOptions{}); err != nil {
+	created, err := r.client.CoreV1().Pods(source.Namespace).Create(ctx, pod, metav1.CreateOptions{})
+	if err != nil {
 		return err
 	}
 	fmt.Fprintf(r.out, "started %s sync pod/%s\n", phase, podName)
-	if err := r.waitPodSucceeded(ctx, source.Namespace, podName); err != nil {
+	if err := r.waitPodSucceeded(ctx, source.Namespace, podName, created.UID); err != nil {
 		return err
 	}
-	return r.cleanupSyncPod(ctx, source.Namespace, podName)
+	return r.cleanupSyncPod(ctx, source.Namespace, podName, created.UID)
 }
 
-func (r *Runner) cleanupSyncPod(ctx context.Context, namespace, name string) error {
-	if err := r.deletePodByName(ctx, namespace, name); err != nil {
+func (r *Runner) validateSyncPod(pod *corev1.Pod, source, dest *corev1.PersistentVolumeClaim) error {
+	if pod.Labels[LabelManagedBy] != ManagedByValue || pod.Labels[LabelRole] != "sync" ||
+		pod.Labels[LabelSourceUID] != string(source.UID) ||
+		pod.Annotations[AnnSourcePVC] != source.Name ||
+		pod.Annotations[AnnDestinationPVC] != dest.Name ||
+		pod.Annotations[AnnTargetStorageClass] != r.opts.TargetStorageClass {
+		return fmt.Errorf("pod/%s already exists without the expected scmigrate sync identity", pod.Name)
+	}
+	return nil
+}
+
+func (r *Runner) cleanupSyncPod(ctx context.Context, namespace, name string, expectedUID types.UID) error {
+	if err := r.deletePodByNameWithUID(ctx, namespace, name, expectedUID); err != nil {
 		return err
 	}
-	return r.waitPodGone(ctx, namespace, name)
+	return r.waitPodGone(ctx, namespace, name, expectedUID)
 }
 
 func (r *Runner) syncNodeName(ctx context.Context, pvc *corev1.PersistentVolumeClaim) (string, error) {
@@ -226,10 +268,10 @@ func affinityForNode(nodeName string) *corev1.Affinity {
 	}
 }
 
-func rcloneCommand(rawArgs string) ([]string, []string, error) {
+func rcloneCommand(rawArgs string) ([]string, []string) {
 	args := append([]string{"sync"}, strings.Fields(rawArgs)...)
 	args = append(args, "/source", "/destination")
-	return []string{"/kubectl-scmigrate", "rclone"}, args, nil
+	return []string{"/kubectl-scmigrate", "rclone"}, args
 }
 
 func validateRunnerImage(image string) error {

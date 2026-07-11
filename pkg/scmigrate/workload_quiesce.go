@@ -32,6 +32,9 @@ func (r *Runner) quiesce(ctx context.Context, pvc *corev1.PersistentVolumeClaim)
 		if err != nil {
 			return err
 		}
+		if err := validateQuiesceRecords(records, pvc.Namespace); err != nil {
+			return err
+		}
 	} else {
 		consumers, err := r.pvcConsumers(ctx, pvc)
 		if err != nil {
@@ -89,13 +92,16 @@ func (r *Runner) quiesceWorkloadGroup(ctx context.Context, pvc *corev1.Persisten
 
 func (r *Runner) quiesceStandalonePods(ctx context.Context, ref WorkloadRef, pods []corev1.Pod) (QuiesceRecord, error) {
 	names := podNames(pods)
-	record := QuiesceRecord{Kind: WorkloadKindPod, Name: names[0], Namespace: ref.Namespace, PodName: names[0], PodNames: names}
+	record := QuiesceRecord{Kind: WorkloadKindPod, Name: names[0], Namespace: ref.Namespace, PodName: names[0], PodNames: names, PodUIDs: podUIDs(pods)}
 	return record, nil
 }
 
 func (r *Runner) quiesceDeploymentConsumers(ctx context.Context, pvc *corev1.PersistentVolumeClaim, ref WorkloadRef, pods []corev1.Pod) (QuiesceRecord, error) {
 	deploy, err := r.client.AppsV1().Deployments(ref.Namespace).Get(ctx, ref.Name, metav1.GetOptions{})
 	if err != nil {
+		return QuiesceRecord{}, err
+	}
+	if err := ensureUID("deployment", deploy.Name, ref.UID, deploy.UID); err != nil {
 		return QuiesceRecord{}, err
 	}
 	replicas := int32(1)
@@ -106,13 +112,16 @@ func (r *Runner) quiesceDeploymentConsumers(ctx context.Context, pvc *corev1.Per
 		return QuiesceRecord{}, fmt.Errorf("deployment/%s has no replicas to quiesce", deploy.Name)
 	}
 	names := podNames(pods)
-	record := QuiesceRecord{Kind: WorkloadKindDeployment, Name: deploy.Name, Namespace: ref.Namespace, OriginalReplicas: replicas, PodName: names[0], PodNames: names}
+	record := QuiesceRecord{Kind: WorkloadKindDeployment, Name: deploy.Name, Namespace: ref.Namespace, WorkloadUID: deploy.UID, OriginalReplicas: replicas, PodName: names[0], PodNames: names}
 	return record, nil
 }
 
 func (r *Runner) quiesceReplicaSetConsumers(ctx context.Context, ref WorkloadRef, pods []corev1.Pod) (QuiesceRecord, error) {
 	rs, err := r.client.AppsV1().ReplicaSets(ref.Namespace).Get(ctx, ref.Name, metav1.GetOptions{})
 	if err != nil {
+		return QuiesceRecord{}, err
+	}
+	if err := ensureUID("replicaset", rs.Name, ref.UID, rs.UID); err != nil {
 		return QuiesceRecord{}, err
 	}
 	return r.quiesceReplicaSetObject(ctx, ref, pods, rs)
@@ -127,13 +136,16 @@ func (r *Runner) quiesceReplicaSetObject(ctx context.Context, ref WorkloadRef, p
 		return QuiesceRecord{}, fmt.Errorf("replicaset/%s has no replicas to quiesce", rs.Name)
 	}
 	names := podNames(pods)
-	record := QuiesceRecord{Kind: WorkloadKindReplicaSet, Name: rs.Name, Namespace: ref.Namespace, OriginalReplicas: replicas, PodName: names[0], PodNames: names}
+	record := QuiesceRecord{Kind: WorkloadKindReplicaSet, Name: rs.Name, Namespace: ref.Namespace, WorkloadUID: rs.UID, OriginalReplicas: replicas, PodName: names[0], PodNames: names}
 	return record, nil
 }
 
 func (r *Runner) quiesceStatefulSetConsumers(ctx context.Context, pvc *corev1.PersistentVolumeClaim, ref WorkloadRef, pods []corev1.Pod) (QuiesceRecord, error) {
 	sts, err := r.client.AppsV1().StatefulSets(ref.Namespace).Get(ctx, ref.Name, metav1.GetOptions{})
 	if err != nil {
+		return QuiesceRecord{}, err
+	}
+	if err := ensureUID("statefulset", sts.Name, ref.UID, sts.UID); err != nil {
 		return QuiesceRecord{}, err
 	}
 	if len(pods) == 1 {
@@ -147,7 +159,7 @@ func (r *Runner) quiesceStatefulSetConsumers(ctx context.Context, pvc *corev1.Pe
 		return QuiesceRecord{}, fmt.Errorf("statefulset/%s has no replicas to quiesce", sts.Name)
 	}
 	names := podNames(pods)
-	record := QuiesceRecord{Kind: WorkloadKindStatefulSet, Name: sts.Name, Namespace: ref.Namespace, OriginalReplicas: replicas, PodName: names[0], PodNames: names}
+	record := QuiesceRecord{Kind: WorkloadKindStatefulSet, Name: sts.Name, Namespace: ref.Namespace, WorkloadUID: sts.UID, OriginalReplicas: replicas, PodName: names[0], PodNames: names}
 	return record, nil
 }
 
@@ -163,7 +175,7 @@ func (r *Runner) quiesceStatefulSet(ctx context.Context, pvc *corev1.PersistentV
 	if ordinal >= replicas {
 		return QuiesceRecord{}, fmt.Errorf("statefulset/%s pod/%s ordinal %d is outside current replica count %d", sts.Name, pod.Name, ordinal, replicas)
 	}
-	record := QuiesceRecord{Kind: WorkloadKindStatefulSet, Name: sts.Name, Namespace: pod.Namespace, OriginalReplicas: replicas, PodName: pod.Name, PodNames: []string{pod.Name}}
+	record := QuiesceRecord{Kind: WorkloadKindStatefulSet, Name: sts.Name, Namespace: pod.Namespace, WorkloadUID: sts.UID, OriginalReplicas: replicas, PodName: pod.Name, PodNames: []string{pod.Name}, PodUIDs: podUIDs([]corev1.Pod{*pod})}
 	if replicas > 1 {
 		// Preserve the controller spec outside the PVC before orphaning it; a
 		// multi-replica StatefulSet can then migrate one ordinal at a time.
@@ -181,6 +193,9 @@ func (r *Runner) quiesceDaemonSetConsumers(ctx context.Context, ref WorkloadRef,
 	if err != nil {
 		return QuiesceRecord{}, err
 	}
+	if err := ensureUID("daemonset", ds.Name, ref.UID, ds.UID); err != nil {
+		return QuiesceRecord{}, err
+	}
 	return r.quiesceDaemonSetObject(ctx, ref, pods, ds)
 }
 
@@ -194,8 +209,10 @@ func (r *Runner) quiesceDaemonSetObject(ctx context.Context, ref WorkloadRef, po
 		Kind:              WorkloadKindDaemonSet,
 		Name:              ds.Name,
 		Namespace:         ref.Namespace,
+		WorkloadUID:       ds.UID,
 		PodName:           names[0],
 		PodNames:          names,
+		PodUIDs:           podUIDs(pods),
 		NodeName:          nodes[0],
 		NodeNames:         nodes,
 		DaemonSetStrategy: ds.Spec.UpdateStrategy,
@@ -234,7 +251,7 @@ func groupPVCConsumers(consumers []PVCConsumer) []workloadConsumers {
 }
 
 func workloadKey(ref WorkloadRef) string {
-	return ref.Namespace + "\x00" + ref.Kind + "\x00" + ref.Name
+	return ref.Namespace + "\x00" + ref.Kind + "\x00" + ref.Name + "\x00" + string(ref.UID)
 }
 
 func podNames(pods []corev1.Pod) []string {
@@ -277,11 +294,6 @@ func (r *Runner) storeStatefulSetForRecreate(ctx context.Context, pvc *corev1.Pe
 		fmt.Fprintf(r.out, "dry-run: create configmap/%s with statefulset/%s restore record\n", name, sts.Name)
 		return name, nil
 	}
-	if _, err := r.client.CoreV1().ConfigMaps(sts.Namespace).Get(ctx, name, metav1.GetOptions{}); err == nil {
-		return name, nil
-	} else if !apierrors.IsNotFound(err) {
-		return "", err
-	}
 	stored := statefulSetForRecreate(sts)
 	data, err := json.Marshal(stored)
 	if err != nil {
@@ -303,11 +315,33 @@ func (r *Runner) storeStatefulSetForRecreate(ctx context.Context, pvc *corev1.Pe
 		},
 		Data: map[string]string{ConfigMapKeyStatefulSet: string(data)},
 	}
+	if existing, err := r.client.CoreV1().ConfigMaps(sts.Namespace).Get(ctx, name, metav1.GetOptions{}); err == nil {
+		return name, validateStatefulSetRecord(existing, cm)
+	} else if !apierrors.IsNotFound(err) {
+		return "", err
+	}
 	_, err = r.client.CoreV1().ConfigMaps(sts.Namespace).Create(ctx, cm, metav1.CreateOptions{})
-	if err != nil && !apierrors.IsAlreadyExists(err) {
+	if apierrors.IsAlreadyExists(err) {
+		existing, getErr := r.client.CoreV1().ConfigMaps(sts.Namespace).Get(ctx, name, metav1.GetOptions{})
+		if getErr != nil {
+			return "", getErr
+		}
+		return name, validateStatefulSetRecord(existing, cm)
+	}
+	if err != nil {
 		return "", err
 	}
 	return name, nil
+}
+
+func validateStatefulSetRecord(existing, expected *corev1.ConfigMap) error {
+	if existing.Labels[LabelManagedBy] != ManagedByValue || existing.Labels[LabelRole] != "statefulset-record" ||
+		existing.Annotations[AnnSourcePVC] != expected.Annotations[AnnSourcePVC] ||
+		existing.Annotations[AnnSourceNamespace] != expected.Annotations[AnnSourceNamespace] ||
+		existing.Data[ConfigMapKeyStatefulSet] != expected.Data[ConfigMapKeyStatefulSet] {
+		return fmt.Errorf("configmap/%s already exists without the expected StatefulSet restore record", existing.Name)
+	}
+	return nil
 }
 
 func statefulSetForRecreate(sts *appsv1.StatefulSet) *appsv1.StatefulSet {

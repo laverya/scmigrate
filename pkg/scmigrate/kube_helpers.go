@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -24,8 +25,18 @@ func (r *Runner) patchPVCAnnotations(ctx context.Context, pvc *corev1.Persistent
 		fmt.Fprintf(r.out, "dry-run: patch pvc/%s annotations %v\n", pvc.Name, sortedKeys(annotations))
 		return nil
 	}
-	merged := mergedStringMap(pvc.Annotations, annotations)
-	data, err := jsonPatchWithUIDTest(pvc.UID, jsonPatchOperation{Op: "add", Path: "/metadata/annotations", Value: merged})
+	current, err := r.client.CoreV1().PersistentVolumeClaims(pvc.Namespace).Get(ctx, pvc.Name, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+	if pvc.UID != "" && current.UID != pvc.UID {
+		return fmt.Errorf("pvc/%s was replaced: expected UID %q, found %q", pvc.Name, pvc.UID, current.UID)
+	}
+	merged := cloneMap(current.Annotations)
+	for key, value := range annotations {
+		merged[key] = value
+	}
+	data, err := jsonPatchForObject(current, jsonPatchOperation{Op: "add", Path: "/metadata/annotations", Value: merged})
 	if err != nil {
 		return err
 	}
@@ -33,56 +44,97 @@ func (r *Runner) patchPVCAnnotations(ctx context.Context, pvc *corev1.Persistent
 	return err
 }
 
-func (r *Runner) waitPVCBound(ctx context.Context, namespace, name string) error {
+func (r *Runner) waitPVCBound(ctx context.Context, namespace, name string, expectedUID types.UID) error {
 	return wait(ctx, 20*time.Minute, func() (bool, error) {
 		pvc, err := r.client.CoreV1().PersistentVolumeClaims(namespace).Get(ctx, name, metav1.GetOptions{})
 		if err != nil {
+			return false, err
+		}
+		if err := ensureUID("pvc", name, expectedUID, pvc.UID); err != nil {
 			return false, err
 		}
 		return pvc.Status.Phase == corev1.ClaimBound && pvc.Spec.VolumeName != "", nil
 	})
 }
 
-func (r *Runner) waitPVCGone(ctx context.Context, namespace, name string) error {
+func (r *Runner) waitPVCGone(ctx context.Context, namespace, name string, expectedUID types.UID) error {
 	return wait(ctx, 10*time.Minute, func() (bool, error) {
-		_, err := r.client.CoreV1().PersistentVolumeClaims(namespace).Get(ctx, name, metav1.GetOptions{})
+		pvc, err := r.client.CoreV1().PersistentVolumeClaims(namespace).Get(ctx, name, metav1.GetOptions{})
 		if apierrors.IsNotFound(err) {
 			return true, nil
+		}
+		if err == nil {
+			err = ensureUID("pvc", name, expectedUID, pvc.UID)
 		}
 		return false, err
 	})
 }
 
-func (r *Runner) waitPodGone(ctx context.Context, namespace, name string) error {
+func (r *Runner) waitPodGone(ctx context.Context, namespace, name string, expectedUID types.UID) error {
 	return wait(ctx, 10*time.Minute, func() (bool, error) {
-		_, err := r.client.CoreV1().Pods(namespace).Get(ctx, name, metav1.GetOptions{})
+		pod, err := r.client.CoreV1().Pods(namespace).Get(ctx, name, metav1.GetOptions{})
 		if apierrors.IsNotFound(err) {
 			return true, nil
+		}
+		if err == nil {
+			err = ensureUID("pod", name, expectedUID, pod.UID)
 		}
 		return false, err
 	})
 }
 
-func (r *Runner) waitPodSucceeded(ctx context.Context, namespace, name string) error {
+func (r *Runner) waitPodSucceeded(ctx context.Context, namespace, name string, expectedUID types.UID) error {
 	return wait(ctx, 24*time.Hour, func() (bool, error) {
 		pod, err := r.client.CoreV1().Pods(namespace).Get(ctx, name, metav1.GetOptions{})
 		if err != nil {
 			return false, err
 		}
+		if err := ensureUID("pod", name, expectedUID, pod.UID); err != nil {
+			return false, err
+		}
 		if pod.Status.Phase == corev1.PodFailed {
-			return false, fmt.Errorf("pod/%s failed", name)
+			return false, syncPodFailure(pod)
 		}
 		return pod.Status.Phase == corev1.PodSucceeded, nil
 	})
 }
 
+func syncPodFailure(pod *corev1.Pod) error {
+	detail := strings.TrimSpace(pod.Status.Message)
+	for _, status := range pod.Status.ContainerStatuses {
+		terminated := status.State.Terminated
+		if terminated == nil {
+			continue
+		}
+		containerDetail := strings.TrimSpace(terminated.Message)
+		if containerDetail == "" {
+			containerDetail = strings.TrimSpace(terminated.Reason)
+		}
+		if containerDetail != "" {
+			detail = fmt.Sprintf("container %s: %s", status.Name, containerDetail)
+		}
+		break
+	}
+	if detail == "" {
+		return fmt.Errorf("pod/%s failed", pod.Name)
+	}
+	return fmt.Errorf("pod/%s failed: %s", pod.Name, detail)
+}
+
 func (r *Runner) deletePodByName(ctx context.Context, namespace, name string) error {
+	return r.deletePodByNameWithUID(ctx, namespace, name, "")
+}
+
+func (r *Runner) deletePodByNameWithUID(ctx context.Context, namespace, name string, expectedUID types.UID) error {
 	pod, err := r.client.CoreV1().Pods(namespace).Get(ctx, name, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
 		return nil
 	}
 	if err != nil {
 		return err
+	}
+	if expectedUID != "" && pod.UID != expectedUID {
+		return fmt.Errorf("pod/%s was replaced: expected UID %q, found %q", name, expectedUID, pod.UID)
 	}
 	return r.deletePod(ctx, pod)
 }
@@ -159,7 +211,7 @@ func (r *Runner) pvcConsumers(ctx context.Context, pvc *corev1.PersistentVolumeC
 func (r *Runner) workloadRefForPod(ctx context.Context, pod *corev1.Pod) (WorkloadRef, error) {
 	owner := controllerOwner(pod.OwnerReferences)
 	if owner == nil {
-		return WorkloadRef{Kind: WorkloadKindPod, Namespace: pod.Namespace, Name: pod.Name}, nil
+		return WorkloadRef{Kind: WorkloadKindPod, Namespace: pod.Namespace, Name: pod.Name, UID: pod.UID}, nil
 	}
 
 	switch owner.Kind {
@@ -168,12 +220,15 @@ func (r *Runner) workloadRefForPod(ctx context.Context, pod *corev1.Pod) (Worklo
 		if err != nil {
 			return WorkloadRef{}, err
 		}
-		if deployOwner := controllerOwner(rs.OwnerReferences); deployOwner != nil && deployOwner.Kind == WorkloadKindDeployment {
-			return WorkloadRef{Kind: WorkloadKindDeployment, Namespace: pod.Namespace, Name: deployOwner.Name}, nil
+		if err := ensureUID("replicaset", rs.Name, owner.UID, rs.UID); err != nil {
+			return WorkloadRef{}, err
 		}
-		return WorkloadRef{Kind: WorkloadKindReplicaSet, Namespace: pod.Namespace, Name: owner.Name}, nil
+		if deployOwner := controllerOwner(rs.OwnerReferences); deployOwner != nil && deployOwner.Kind == WorkloadKindDeployment {
+			return WorkloadRef{Kind: WorkloadKindDeployment, Namespace: pod.Namespace, Name: deployOwner.Name, UID: deployOwner.UID}, nil
+		}
+		return WorkloadRef{Kind: WorkloadKindReplicaSet, Namespace: pod.Namespace, Name: owner.Name, UID: owner.UID}, nil
 	case WorkloadKindStatefulSet, WorkloadKindDaemonSet:
-		return WorkloadRef{Kind: owner.Kind, Namespace: pod.Namespace, Name: owner.Name}, nil
+		return WorkloadRef{Kind: owner.Kind, Namespace: pod.Namespace, Name: owner.Name, UID: owner.UID}, nil
 	default:
 		return WorkloadRef{}, fmt.Errorf("unsupported pod controller %s/%s for pod/%s", owner.Kind, owner.Name, pod.Name)
 	}
@@ -261,21 +316,22 @@ func deleteOptionsForUIDWithPropagation(uid types.UID, policy metav1.DeletionPro
 	return opts
 }
 
-func jsonPatchWithUIDTest(uid types.UID, ops ...jsonPatchOperation) ([]byte, error) {
-	if uid != "" {
-		ops = append([]jsonPatchOperation{{
+func jsonPatchForObject(object metav1.Object, ops ...jsonPatchOperation) ([]byte, error) {
+	preconditions := make([]jsonPatchOperation, 0, 2)
+	if uid := object.GetUID(); uid != "" {
+		preconditions = append(preconditions, jsonPatchOperation{
 			Op:    "test",
 			Path:  "/metadata/uid",
 			Value: string(uid),
-		}}, ops...)
+		})
 	}
+	if resourceVersion := object.GetResourceVersion(); resourceVersion != "" {
+		preconditions = append(preconditions, jsonPatchOperation{
+			Op:    "test",
+			Path:  "/metadata/resourceVersion",
+			Value: resourceVersion,
+		})
+	}
+	ops = append(preconditions, ops...)
 	return json.Marshal(ops)
-}
-
-func mergedStringMap(base, updates map[string]string) map[string]string {
-	merged := cloneMap(base)
-	for key, value := range updates {
-		merged[key] = value
-	}
-	return merged
 }

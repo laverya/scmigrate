@@ -9,6 +9,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -28,21 +29,27 @@ func (r *Runner) storeQuiesceAnnotation(ctx context.Context, pvc *corev1.Persist
 	}
 	if dest, err := r.destinationPVC(ctx, pvc); err == nil {
 		return r.patchPVCAnnotations(ctx, dest, map[string]string{AnnQuiesce: string(data)})
+	} else if !apierrors.IsNotFound(err) {
+		return fmt.Errorf("get destination PVC while storing quiesce record: %w", err)
 	}
 	return nil
 }
 
 func (r *Runner) restoreWorkload(ctx context.Context, pvc *corev1.PersistentVolumeClaim) error {
 	current, err := r.client.CoreV1().PersistentVolumeClaims(pvc.Namespace).Get(ctx, pvc.Name, metav1.GetOptions{})
-	if err == nil {
-		pvc = current
+	if err != nil {
+		return fmt.Errorf("refresh pvc/%s before workload restore: %w", pvc.Name, err)
 	}
+	pvc = current
 	recordRaw := pvc.Annotations[AnnQuiesce]
 	if recordRaw == "" {
 		return r.patchPVCAnnotations(ctx, pvc, map[string]string{AnnState: StateRestored})
 	}
 	records, err := quiesceRecordsFromAnnotation(recordRaw)
 	if err != nil {
+		return err
+	}
+	if err := validateQuiesceRecords(records, pvc.Namespace); err != nil {
 		return err
 	}
 	if r.opts.DryRun {
@@ -85,17 +92,14 @@ func (r *Runner) restoreQuiesceRecord(ctx context.Context, record QuiesceRecord)
 	switch record.Kind {
 	case WorkloadKindNone:
 	case WorkloadKindPod:
-		names := record.PodNames
-		if len(names) == 0 && record.PodName != "" {
-			names = []string{record.PodName}
-		}
+		names := recordPodNames(record)
 		fmt.Fprintf(r.out, "standalone pod(s) %s were deleted; recreate them manually if needed\n", strings.Join(names, ","))
 	case WorkloadKindDeployment:
-		if err := r.scaleDeployment(ctx, record.Namespace, record.Name, record.OriginalReplicas); err != nil {
+		if err := r.scaleDeployment(ctx, record.Namespace, record.Name, record.OriginalReplicas, record.WorkloadUID); err != nil {
 			return err
 		}
 	case WorkloadKindReplicaSet:
-		if err := r.scaleReplicaSet(ctx, record.Namespace, record.Name, record.OriginalReplicas); err != nil {
+		if err := r.scaleReplicaSet(ctx, record.Namespace, record.Name, record.OriginalReplicas, record.WorkloadUID); err != nil {
 			return err
 		}
 	case WorkloadKindStatefulSet:
@@ -104,7 +108,7 @@ func (r *Runner) restoreQuiesceRecord(ctx context.Context, record QuiesceRecord)
 				return err
 			}
 		} else {
-			if err := r.scaleStatefulSet(ctx, record.Namespace, record.Name, record.OriginalReplicas); err != nil {
+			if err := r.scaleStatefulSet(ctx, record.Namespace, record.Name, record.OriginalReplicas, record.WorkloadUID); err != nil {
 				return err
 			}
 		}
@@ -130,7 +134,17 @@ func (r *Runner) restoreOrphanedStatefulSet(ctx context.Context, record QuiesceR
 	}
 	sts = statefulSetForRecreate(sts)
 	_, err = r.client.AppsV1().StatefulSets(sts.Namespace).Create(ctx, sts, metav1.CreateOptions{})
-	if err != nil && !apierrors.IsAlreadyExists(err) {
+	if apierrors.IsAlreadyExists(err) {
+		existing, getErr := r.client.AppsV1().StatefulSets(sts.Namespace).Get(ctx, sts.Name, metav1.GetOptions{})
+		if getErr != nil {
+			return getErr
+		}
+		if !apiequality.Semantic.DeepEqual(existing.Spec, sts.Spec) {
+			return fmt.Errorf("statefulset/%s already exists with a different spec than the restore record", sts.Name)
+		}
+		return nil
+	}
+	if err != nil {
 		return err
 	}
 	return nil
@@ -150,12 +164,19 @@ func (r *Runner) statefulSetForRecord(ctx context.Context, record QuiesceRecord)
 		if err := json.Unmarshal([]byte(raw), &sts); err != nil {
 			return nil, err
 		}
-		return &sts, nil
+		return validateStatefulSetForRecord(&sts, record)
 	}
 	if record.StatefulSet == nil {
 		return nil, fmt.Errorf("statefulset quiesce record for %s/%s has no restore object", record.Namespace, record.Name)
 	}
-	return record.StatefulSet, nil
+	return validateStatefulSetForRecord(record.StatefulSet, record)
+}
+
+func validateStatefulSetForRecord(sts *appsv1.StatefulSet, record QuiesceRecord) (*appsv1.StatefulSet, error) {
+	if sts.Namespace != record.Namespace || sts.Name != record.Name {
+		return nil, fmt.Errorf("StatefulSet restore object is for %s/%s, expected %s/%s", sts.Namespace, sts.Name, record.Namespace, record.Name)
+	}
+	return sts, nil
 }
 
 func (r *Runner) restoreDaemonSet(ctx context.Context, record QuiesceRecord) error {
@@ -167,8 +188,11 @@ func (r *Runner) restoreDaemonSet(ctx context.Context, record QuiesceRecord) err
 	if err != nil {
 		return err
 	}
-	data, err := jsonPatchWithUIDTest(
-		ds.UID,
+	if err := ensureUID("daemonset", ds.Name, record.WorkloadUID, ds.UID); err != nil {
+		return err
+	}
+	data, err := jsonPatchForObject(
+		ds,
 		jsonPatchOperation{Op: "add", Path: "/spec/updateStrategy", Value: strategy},
 		jsonPatchOperation{Op: "add", Path: "/spec/template/spec/affinity", Value: record.DaemonSetAffinity},
 	)
@@ -189,10 +213,16 @@ func (r *Runner) waitWorkloadRestored(ctx context.Context, record QuiesceRecord)
 			if err != nil {
 				return false, err
 			}
+			if err := ensureUID("deployment", deploy.Name, record.WorkloadUID, deploy.UID); err != nil {
+				return false, err
+			}
 			return deploy.Status.ReadyReplicas >= record.OriginalReplicas, nil
 		case WorkloadKindReplicaSet:
 			rs, err := r.client.AppsV1().ReplicaSets(record.Namespace).Get(ctx, record.Name, metav1.GetOptions{})
 			if err != nil {
+				return false, err
+			}
+			if err := ensureUID("replicaset", rs.Name, record.WorkloadUID, rs.UID); err != nil {
 				return false, err
 			}
 			return rs.Status.ReadyReplicas >= record.OriginalReplicas, nil
@@ -201,12 +231,21 @@ func (r *Runner) waitWorkloadRestored(ctx context.Context, record QuiesceRecord)
 			if err != nil {
 				return false, err
 			}
+			if record.StatefulSetConfigMap == "" && record.StatefulSet == nil {
+				if err := ensureUID("statefulset", sts.Name, record.WorkloadUID, sts.UID); err != nil {
+					return false, err
+				}
+			}
 			return sts.Status.ReadyReplicas >= record.OriginalReplicas, nil
 		case WorkloadKindDaemonSet:
-			nodes := record.NodeNames
-			if len(nodes) == 0 && record.NodeName != "" {
-				nodes = []string{record.NodeName}
+			ds, err := r.client.AppsV1().DaemonSets(record.Namespace).Get(ctx, record.Name, metav1.GetOptions{})
+			if err != nil {
+				return false, err
 			}
+			if err := ensureUID("daemonset", ds.Name, record.WorkloadUID, ds.UID); err != nil {
+				return false, err
+			}
+			nodes := recordNodeNames(record)
 			for _, node := range nodes {
 				ok, err := r.daemonSetPodReadyOnNode(ctx, record.Namespace, record.Name, node)
 				if err != nil || !ok {
@@ -235,7 +274,9 @@ func (r *Runner) daemonSetPodReadyOnNode(ctx context.Context, namespace, name, n
 	}
 	for i := range pods.Items {
 		pod := &pods.Items[i]
-		if pod.Spec.NodeName == nodeName && podReady(pod) {
+		owner := controllerOwner(pod.OwnerReferences)
+		owned := owner != nil && owner.Kind == WorkloadKindDaemonSet && owner.Name == ds.Name && (owner.UID == "" || ds.UID == "" || owner.UID == ds.UID)
+		if owned && pod.Spec.NodeName == nodeName && podReady(pod) {
 			return true, nil
 		}
 	}

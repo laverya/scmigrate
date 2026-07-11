@@ -97,11 +97,13 @@ func tempPVCName(pvc *corev1.PersistentVolumeClaim) string {
 }
 
 func syncPodName(pvc *corev1.PersistentVolumeClaim, phase string) string {
-	name := fmt.Sprintf("scmigrate-%s-%s-%s", phase, pvc.Name, shortHash(string(pvc.UID)))
-	if len(name) > 63 {
-		name = name[:63]
+	hash := shortHash(string(pvc.UID))
+	base := fmt.Sprintf("scmigrate-%s-%s", phase, pvc.Name)
+	maxBase := 63 - len(hash) - 1
+	if len(base) > maxBase {
+		base = base[:maxBase]
 	}
-	return strings.TrimRight(name, "-")
+	return strings.TrimRight(base, "-") + "-" + hash
 }
 
 func shortHash(value string) string {

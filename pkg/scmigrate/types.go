@@ -4,6 +4,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 type Options struct {
@@ -34,6 +35,7 @@ type WorkloadRef struct {
 	Kind      string
 	Namespace string
 	Name      string
+	UID       types.UID
 }
 
 type PVCConsumer struct {
@@ -57,9 +59,11 @@ type QuiesceRecord struct {
 	Kind                 string                         `json:"kind"`
 	Name                 string                         `json:"name"`
 	Namespace            string                         `json:"namespace"`
+	WorkloadUID          types.UID                      `json:"workloadUID,omitempty"`
 	OriginalReplicas     int32                          `json:"originalReplicas"`
 	PodName              string                         `json:"podName"`
 	PodNames             []string                       `json:"podNames,omitempty"`
+	PodUIDs              map[string]types.UID           `json:"podUIDs,omitempty"`
 	NodeName             string                         `json:"nodeName,omitempty"`
 	NodeNames            []string                       `json:"nodeNames,omitempty"`
 	StatefulSetConfigMap string                         `json:"statefulSetConfigMap,omitempty"`
