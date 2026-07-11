@@ -1,10 +1,45 @@
 package scmigrate
 
 import (
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 )
+
+func TestSyncPodFailureIncludesTerminationReason(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "sync"},
+		Status: corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{{
+			Name:  "rclone",
+			State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{Reason: "Error", Message: "copy failed"}},
+		}}},
+	}
+	err := syncPodFailure(pod)
+	if !strings.Contains(err.Error(), "container rclone: copy failed") {
+		t.Fatalf("syncPodFailure() = %v, want container detail", err)
+	}
+}
+
+func TestSyncPodNamePreservesUIDHashWhenTruncated(t *testing.T) {
+	prefix := strings.Repeat("a", 61)
+	first := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: prefix + "-x", UID: types.UID("uid-one")}}
+	second := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: prefix + "-y", UID: types.UID("uid-two")}}
+
+	firstName := syncPodName(first, SyncPhaseInitial)
+	secondName := syncPodName(second, SyncPhaseInitial)
+	if len(firstName) > 63 || len(secondName) > 63 {
+		t.Fatalf("sync pod names exceed DNS label limit: %q %q", firstName, secondName)
+	}
+	if firstName == secondName {
+		t.Fatalf("distinct PVC UIDs produced the same sync pod name %q", firstName)
+	}
+	if !strings.HasSuffix(firstName, shortHash(string(first.UID))) || !strings.HasSuffix(secondName, shortHash(string(second.UID))) {
+		t.Fatalf("sync pod names do not preserve UID hashes: %q %q", firstName, secondName)
+	}
+}
 
 func TestAffinityForNodePinsWithMatchField(t *testing.T) {
 	affinity := affinityForNode("node-a")

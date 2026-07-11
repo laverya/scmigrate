@@ -5,7 +5,9 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 
 	_ "github.com/rclone/rclone/backend/local"
 	rclonecmd "github.com/rclone/rclone/cmd"
@@ -45,6 +47,10 @@ func main() {
 		runRclone(os.Args[2:])
 		return
 	}
+	if command != "plan" && command != "run" {
+		usage()
+		os.Exit(2)
+	}
 
 	var annotations annotationFilters
 	fs := flag.NewFlagSet("kubectl-scmigrate", flag.ExitOnError)
@@ -68,21 +74,18 @@ func main() {
 	}
 	opts.AnnotationFilters = annotations
 
-	ctx := context.Background()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 	runner, err := scmigrate.NewRunner(opts, os.Stdout)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 
-	switch command {
-	case "plan":
+	if command == "plan" {
 		err = runner.Plan(ctx)
-	case "run":
+	} else {
 		err = runner.Run(ctx)
-	default:
-		usage()
-		os.Exit(2)
 	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)

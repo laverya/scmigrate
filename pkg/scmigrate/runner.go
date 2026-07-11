@@ -19,11 +19,11 @@ type Runner struct {
 }
 
 func NewRunner(opts Options, out io.Writer) (*Runner, error) {
-	if opts.TargetStorageClass == "" {
-		return nil, errors.New("--target-storage-class is required")
+	if err := validateOptions(opts); err != nil {
+		return nil, err
 	}
-	if opts.AllNamespaces && opts.Namespace != "" {
-		return nil, errors.New("use either --namespace or --all-namespaces, not both")
+	if out == nil {
+		return nil, errors.New("output writer is required")
 	}
 	client, currentNamespace, err := kubernetesClient()
 	if err != nil {
@@ -89,7 +89,10 @@ func (r *Runner) Run(ctx context.Context) error {
 	}
 	if !r.opts.Yes && !r.opts.DryRun {
 		fmt.Fprintf(r.out, "About to migrate %d PVC(s) to storageClass %q. Continue [y/N]? ", len(migrations), r.opts.TargetStorageClass)
-		answer, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+		answer, readErr := bufio.NewReader(os.Stdin).ReadString('\n')
+		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			return fmt.Errorf("read confirmation: %w", readErr)
+		}
 		if strings.TrimSpace(strings.ToLower(answer)) != "y" && strings.TrimSpace(strings.ToLower(answer)) != "yes" {
 			return errors.New("aborted")
 		}

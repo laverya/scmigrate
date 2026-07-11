@@ -309,6 +309,52 @@ func TestQuiesceRecordsFromAnnotationAcceptsSingleAndArray(t *testing.T) {
 	}
 }
 
+func TestValidateQuiesceRecordsRejectsCrossNamespaceTarget(t *testing.T) {
+	records := []QuiesceRecord{{Kind: WorkloadKindDeployment, Namespace: "other", Name: "app", OriginalReplicas: 1}}
+	err := validateQuiesceRecords(records, "default")
+	if err == nil || !strings.Contains(err.Error(), "targets namespace") {
+		t.Fatalf("validateQuiesceRecords() error = %v, want namespace error", err)
+	}
+}
+
+func TestStatefulSetForRecordRejectsMismatchedRestoreObject(t *testing.T) {
+	replicas := int32(1)
+	stored := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "other-app", Namespace: "other"},
+		Spec:       appsv1.StatefulSetSpec{Replicas: &replicas},
+	}
+	raw, err := json.Marshal(statefulSetForRecreate(stored))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "restore", Namespace: "default"},
+		Data:       map[string]string{ConfigMapKeyStatefulSet: string(raw)},
+	}
+	runner := &Runner{client: fake.NewSimpleClientset(cm), out: io.Discard}
+	record := QuiesceRecord{Kind: WorkloadKindStatefulSet, Namespace: "default", Name: "app", OriginalReplicas: 1, StatefulSetConfigMap: cm.Name}
+
+	_, err = runner.statefulSetForRecord(testContext(t), record)
+	if err == nil || !strings.Contains(err.Error(), "expected default/app") {
+		t.Fatalf("statefulSetForRecord() error = %v, want mismatched restore object error", err)
+	}
+}
+
+func TestRestoreOrphanedStatefulSetRejectsExistingDifferentSpec(t *testing.T) {
+	desiredReplicas := int32(2)
+	existingReplicas := int32(1)
+	desired := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: "app", Namespace: "default"}, Spec: appsv1.StatefulSetSpec{Replicas: &desiredReplicas}}
+	existing := desired.DeepCopy()
+	existing.Spec.Replicas = &existingReplicas
+	runner := &Runner{client: fake.NewSimpleClientset(existing), out: io.Discard}
+	record := QuiesceRecord{Kind: WorkloadKindStatefulSet, Namespace: "default", Name: "app", OriginalReplicas: 2, StatefulSet: desired}
+
+	err := runner.restoreOrphanedStatefulSet(testContext(t), record)
+	if err == nil || !strings.Contains(err.Error(), "different spec") {
+		t.Fatalf("restoreOrphanedStatefulSet() error = %v, want different spec error", err)
+	}
+}
+
 func TestSyncNodeNameUsesCommonConsumerNode(t *testing.T) {
 	pvc := testPVC("default", "data")
 	runner := &Runner{client: fake.NewSimpleClientset(
@@ -751,7 +797,7 @@ func TestWaitWorkloadRestoredRecognizesReadyControllers(t *testing.T) {
 		},
 	}
 	readyDaemonPod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Name: "agent-node-a", Namespace: "default", Labels: map[string]string{"app": "agent"}},
+		ObjectMeta: metav1.ObjectMeta{Name: "agent-node-a", Namespace: "default", Labels: map[string]string{"app": "agent"}, OwnerReferences: []metav1.OwnerReference{controllerRef(WorkloadKindDaemonSet, "agent")}},
 		Spec:       corev1.PodSpec{NodeName: "node-a"},
 		Status: corev1.PodStatus{
 			Phase:      corev1.PodRunning,
@@ -807,6 +853,28 @@ func TestQuiesceDeploymentWithZeroReplicasReturnsError(t *testing.T) {
 	}
 }
 
+func TestApplyQuiesceRecordRejectsReplacementController(t *testing.T) {
+	ctx := testContext(t)
+	deploy := testDeployment("default", "app", 2, map[string]string{"app": "app"})
+	deploy.UID = "replacement-uid"
+	runner := &Runner{client: fake.NewSimpleClientset(deploy), out: io.Discard}
+	record := QuiesceRecord{
+		Kind:             WorkloadKindDeployment,
+		Name:             deploy.Name,
+		Namespace:        deploy.Namespace,
+		WorkloadUID:      "original-uid",
+		OriginalReplicas: 2,
+	}
+
+	err := runner.applyQuiesceRecord(ctx, record)
+	if err == nil || !strings.Contains(err.Error(), "was replaced") {
+		t.Fatalf("applyQuiesceRecord() error = %v, want replacement error", err)
+	}
+	if *deploy.Spec.Replicas != 2 {
+		t.Fatalf("replacement deployment replicas = %d, want 2", *deploy.Spec.Replicas)
+	}
+}
+
 func TestWorkloadRefForPodRejectsUnsupportedController(t *testing.T) {
 	pod := testPod("default", "job-pod", "data", "node-a", controllerRef("Job", "batch"))
 	runner := &Runner{client: fake.NewSimpleClientset(), out: io.Discard}
@@ -814,6 +882,18 @@ func TestWorkloadRefForPodRejectsUnsupportedController(t *testing.T) {
 	_, err := runner.workloadRefForPod(testContext(t), pod)
 	if err == nil || !strings.Contains(err.Error(), "unsupported pod controller") {
 		t.Fatalf("workloadRefForPod error = %v, want unsupported controller", err)
+	}
+}
+
+func TestWorkloadRefForPodRejectsReplacementReplicaSet(t *testing.T) {
+	pod := testPod("default", "worker", "data", "node-a", controllerRef(WorkloadKindReplicaSet, "workers"))
+	pod.OwnerReferences[0].UID = "original-uid"
+	rs := &appsv1.ReplicaSet{ObjectMeta: metav1.ObjectMeta{Name: "workers", Namespace: "default", UID: "replacement-uid"}}
+	runner := &Runner{client: fake.NewSimpleClientset(rs), out: io.Discard}
+
+	_, err := runner.workloadRefForPod(testContext(t), pod)
+	if err == nil || !strings.Contains(err.Error(), "was replaced") {
+		t.Fatalf("workloadRefForPod() error = %v, want replacement error", err)
 	}
 }
 
@@ -908,7 +988,7 @@ func TestDaemonSetPodReadyOnNodeFindsReadyReplacement(t *testing.T) {
 		},
 	}
 	readyPod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Name: "agent-node-a-new", Namespace: "default", Labels: map[string]string{"app": "agent"}},
+		ObjectMeta: metav1.ObjectMeta{Name: "agent-node-a-new", Namespace: "default", Labels: map[string]string{"app": "agent"}, OwnerReferences: []metav1.OwnerReference{controllerRef(WorkloadKindDaemonSet, "agent")}},
 		Spec:       corev1.PodSpec{NodeName: "node-a"},
 		Status: corev1.PodStatus{
 			Phase:      corev1.PodRunning,

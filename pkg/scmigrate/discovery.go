@@ -2,9 +2,7 @@ package scmigrate
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -34,7 +32,11 @@ func (r *Runner) discover(ctx context.Context) ([]*Migration, error) {
 		}
 		for i := range pvcs.Items {
 			pvc := pvcs.Items[i].DeepCopy()
-			if r.skipPVC(pvc) {
+			skip, err := r.skipPVC(pvc)
+			if err != nil {
+				return nil, err
+			}
+			if skip {
 				continue
 			}
 			if err := validateSourcePVC(pvc); err != nil {
@@ -77,12 +79,12 @@ func (r *Runner) discover(ctx context.Context) ([]*Migration, error) {
 			return nil, err
 		}
 		migrations = append(migrations, resumable...)
-		pvResumable, err := r.discoverResumableCutoverPVs(ctx, namespace)
-		if err != nil {
-			return nil, err
-		}
-		migrations = append(migrations, pvResumable...)
 	}
+	pvResumable, err := r.discoverResumableCutoverPVs(ctx, namespaces)
+	if err != nil {
+		return nil, err
+	}
+	migrations = append(migrations, pvResumable...)
 	sortMigrations(migrations)
 	return migrations, nil
 }
@@ -152,16 +154,21 @@ func (r *Runner) discoverResumableDestinations(ctx context.Context, namespace st
 	return migrations, nil
 }
 
-func (r *Runner) discoverResumableCutoverPVs(ctx context.Context, namespace string) ([]*Migration, error) {
+func (r *Runner) discoverResumableCutoverPVs(ctx context.Context, namespaces []string) ([]*Migration, error) {
 	pvs, err := r.client.CoreV1().PersistentVolumes().List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return nil, err
+	}
+	selectedNamespaces := make(map[string]struct{}, len(namespaces))
+	for _, namespace := range namespaces {
+		selectedNamespaces[namespace] = struct{}{}
 	}
 	var migrations []*Migration
 	for i := range pvs.Items {
 		pv := pvs.Items[i].DeepCopy()
 		annotations := pv.Annotations
-		if annotations[AnnSourceNamespace] != namespace || annotations[AnnOriginalPVC] == "" {
+		namespace := annotations[AnnSourceNamespace]
+		if _, selected := selectedNamespaces[namespace]; !selected || annotations[AnnOriginalPVC] == "" {
 			continue
 		}
 		sourceName := annotations[AnnSourcePVC]
@@ -236,65 +243,35 @@ func (r *Runner) storedPVCMatchesOptions(stored *StoredPVC) (bool, error) {
 	if r.opts.SourceStorageClass != "" && sourceSC != r.opts.SourceStorageClass {
 		return false, nil
 	}
-	for _, filter := range r.opts.AnnotationFilters {
-		key, value, ok := strings.Cut(filter, "=")
-		if !ok || key == "" {
-			return false, nil
-		}
-		if stored.Annotations[key] != value {
-			return false, nil
-		}
-	}
-	return true, nil
+	return matchesAnnotationFilters(r.opts.AnnotationFilters, stored.Annotations)
 }
 
-func (r *Runner) skipPVC(pvc *corev1.PersistentVolumeClaim) bool {
+func (r *Runner) skipPVC(pvc *corev1.PersistentVolumeClaim) (bool, error) {
 	if pvc.Status.Phase != corev1.ClaimBound || pvc.Spec.VolumeName == "" {
-		return true
+		return true, nil
 	}
 	if pvc.Labels[LabelManagedBy] == ManagedByValue {
-		return true
+		return true, nil
 	}
 	if r.opts.SourceStorageClass != "" && storageClass(pvc) != r.opts.SourceStorageClass {
-		return true
+		return true, nil
 	}
 	if storageClass(pvc) == r.opts.TargetStorageClass && pvc.Annotations[AnnState] == "" {
-		return true
+		return true, nil
 	}
-	for _, filter := range r.opts.AnnotationFilters {
-		key, value, ok := strings.Cut(filter, "=")
-		if !ok || key == "" {
-			return true
-		}
-		if pvc.Annotations[key] != value {
-			return true
-		}
+	matches, err := matchesAnnotationFilters(r.opts.AnnotationFilters, pvc.Annotations)
+	if err != nil {
+		return false, err
 	}
-	return false
+	return !matches, nil
 }
 
 func validateSourcePVC(pvc *corev1.PersistentVolumeClaim) error {
-	if pvc.Spec.VolumeMode != nil && *pvc.Spec.VolumeMode == corev1.PersistentVolumeBlock {
-		return errors.New("block volumeMode is not supported; scmigrate requires filesystem PVCs")
-	}
-	for _, mode := range pvc.Spec.AccessModes {
-		if mode == corev1.ReadWriteOncePod {
-			return errors.New("ReadWriteOncePod access mode is not supported because sync pods need to mount the PVC during migration")
-		}
-	}
-	return nil
+	return validatePVCCompatibility(pvc.Spec.VolumeMode, pvc.Spec.AccessModes)
 }
 
 func validateStoredPVC(stored *StoredPVC) error {
-	if stored.VolumeMode != nil && *stored.VolumeMode == corev1.PersistentVolumeBlock {
-		return errors.New("block volumeMode is not supported; scmigrate requires filesystem PVCs")
-	}
-	for _, mode := range stored.AccessModes {
-		if mode == corev1.ReadWriteOncePod {
-			return errors.New("ReadWriteOncePod access mode is not supported because sync pods need to mount the PVC during migration")
-		}
-	}
-	return nil
+	return validatePVCCompatibility(stored.VolumeMode, stored.AccessModes)
 }
 
 func (r *Runner) validateTargetStorageClass(object string, annotations map[string]string) error {

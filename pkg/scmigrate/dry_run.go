@@ -102,6 +102,9 @@ func (r *Runner) dryRunQuiesce(ctx context.Context, pvc *corev1.PersistentVolume
 		if err != nil {
 			return nil, err
 		}
+		if err := validateQuiesceRecords(parsed, pvc.Namespace); err != nil {
+			return nil, err
+		}
 		records = parsed
 	} else {
 		consumers, err := r.pvcConsumers(ctx, pvc)
